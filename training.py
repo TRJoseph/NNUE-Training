@@ -24,7 +24,7 @@ class ChessDataset(Dataset):
         # for example, "#+4" (mate-in-4 for white) = 10000 + (100/4) = 10025 whereas "#+1" (mate-in-1 for white) = 10000 + (100/1) = 10100
         # this will hopefully reflect to the NN that a quicker mate is a "better" position
         self.chess_labels.loc[mask, "eval"] = self.chess_labels.loc[mask, "eval"].apply(
-            lambda x: 10000 + (100/int(x.replace("#", ""))) if int(x.replace("#", "")) > 0 else -10000 + (100/int(x.replace("#", "")))
+           lambda x: 10500 if x == "#+0" else -10500 if x == "#-0" else (10000 + (100/int(x.replace("#", ""))) if int(x.replace("#", "")) > 0 else -10000 + (100/int(x.replace("#", ""))))
         )
 
         self.transform = transform
