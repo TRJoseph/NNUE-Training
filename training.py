@@ -25,8 +25,9 @@ class ChessDataset(Dataset):
         # this sets the matescore and adds a bias depending on how many moves away from mate it is
         # for example, "#+4" (mate-in-4 for white) = 10000 + (100/4) = 10025 whereas "#+1" (mate-in-1 for white) = 10000 + (100/1) = 10100
         # this will hopefully reflect to the NN that a quicker mate is a "better" position
+        ## GOT RID OF THIS ^ FOR NOW AND USING JUST A SIMPLE MATE SCORE FOR A SIDE THAT IS MATING
         self.chess_labels.loc[mask, "eval"] = self.chess_labels.loc[mask, "eval"].apply(
-           lambda x: 10500 if x == "#+0" else -10500 if x == "#-0" else (10000 + (100/int(x.replace("#", ""))) if int(x.replace("#", "")) > 0 else -10000 + (100/int(x.replace("#", ""))))
+           lambda x: 10000 if x == "#+0" else -10000 if x == "#-0" else (10000 if int(x.replace("#", "")) > 0 else -10000)
         )
 
         self.chess_labels["eval"] = pd.to_numeric(self.chess_labels["eval"], errors="raise")
@@ -73,6 +74,7 @@ class ChessNNUE(nn.Module):
         self.fc1 = nn.Linear(768, 1024) 
         self.crelu = CReLU() 
         self.fc2 = nn.Linear(2048, 1)
+        self.sigmoid = nn.Sigmoid()
 
         # self.linear_relu_stack = nn.Sequential(
         #     nn.Linear(768, 1024),
@@ -81,7 +83,7 @@ class ChessNNUE(nn.Module):
     def forward(self, x):
         hidden = self.fc1(x)          # [batch_size, 1024]
         combined = self.crelu(hidden) # [batch_size, 2048]
-        return self.fc2(combined)     # [batch_size, 1]
+        return self.sigmoid(self.fc2(combined))     # [batch_size, 1]
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
@@ -142,7 +144,7 @@ def main():
     print(f"Using {device} device")
     model = ChessNNUE().to("cuda")
     loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     print(model)
 
     dataset = ChessDataset("chessData.csv", device="cuda")
@@ -155,8 +157,8 @@ def main():
     print(len(training_data), len(test_data))
 
     # prepares data with dataloader
-    train_dataloader = DataLoader(training_data, batch_size=64, shuffle=True)
-    test_dataloader = DataLoader(test_data, batch_size=64, shuffle=True)
+    train_dataloader = DataLoader(training_data, batch_size=128, shuffle=True)
+    test_dataloader = DataLoader(test_data, batch_size=128, shuffle=True)
     for features, evals in train_dataloader:
         print("Train batch:", features.shape, evals.shape)
         break
