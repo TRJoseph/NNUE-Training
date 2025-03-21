@@ -6,6 +6,7 @@ import pandas as pd
 import os
 from torch.utils.data import DataLoader, Dataset, random_split
 from sklearn.model_selection import train_test_split
+import numpy as np
 
 
 piece_map = {
@@ -29,6 +30,9 @@ class ChessDataset(Dataset):
         )
 
         self.chess_labels["eval"] = pd.to_numeric(self.chess_labels["eval"], errors="raise")
+
+        #normalize data
+        self.chess_labels["eval"] = np.sign(self.chess_labels["eval"]) * np.log(1 + np.abs(self.chess_labels["eval"]))
 
         self.transform = transform
         self.target_transform = target_transform
