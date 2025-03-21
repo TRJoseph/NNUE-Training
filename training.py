@@ -14,8 +14,9 @@ piece_map = {
 }
 
 class ChessDataset(Dataset):
-    def __init__(self, chess_positions_file, transform=None, target_transform=None):
-        self.chess_labels = pd.read_csv("./Data/" + chess_positions_file, names=["fen", "eval"])
+    def __init__(self, chess_positions_file, device="cuda", transform=None, target_transform=None):
+        self.chess_labels = pd.read_csv("./Data/" + chess_positions_file, names=["fen", "eval"], encoding='utf-8')
+        self.device = device
 
         # mask for boolean array of every evaluation with checkmate in x number of moves
         mask = self.chess_labels["eval"].str.contains("#", na=False)
@@ -26,6 +27,8 @@ class ChessDataset(Dataset):
         self.chess_labels.loc[mask, "eval"] = self.chess_labels.loc[mask, "eval"].apply(
            lambda x: 10500 if x == "#+0" else -10500 if x == "#-0" else (10000 + (100/int(x.replace("#", ""))) if int(x.replace("#", "")) > 0 else -10000 + (100/int(x.replace("#", ""))))
         )
+
+        self.chess_labels["eval"] = pd.to_numeric(self.chess_labels["eval"], errors="raise")
 
         self.transform = transform
         self.target_transform = target_transform
@@ -46,7 +49,10 @@ class ChessDataset(Dataset):
             offset = 0 if piece.color == chess.WHITE else 6
             index = square * 12 + piece_map[piece.piece_type] + offset
             features[index] = 1
-        tensor = torch.tensor(features, dtype=torch.float32), torch.tensor([float(evaluation)], dtype=torch.float32)
+        tensor = (
+            torch.tensor(features, dtype=torch.float32, device=self.device),
+            torch.tensor([float(evaluation)], dtype=torch.float32, device=self.device)
+        )
         return tensor
 
 class CReLU(nn.Module):
@@ -61,6 +67,7 @@ class ChessNNUE(nn.Module):
         super().__init__()
 
         self.fc1 = nn.Linear(768, 1024) 
+        self.crelu = CReLU() 
         self.fc2 = nn.Linear(2048, 1)
 
         # self.linear_relu_stack = nn.Sequential(
@@ -68,9 +75,9 @@ class ChessNNUE(nn.Module):
         #     nn.Linear(2048, 1)
         # )
     def forward(self, x):
-        hidden = self.fc1(x)
-        combined = torch.cat((hidden, hidden), dim=1)
-        return self.fc2(combined)
+        hidden = self.fc1(x)          # [batch_size, 1024]
+        combined = self.crelu(hidden) # [batch_size, 2048]
+        return self.fc2(combined)     # [batch_size, 1]
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
@@ -92,24 +99,18 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
             print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
 def test_loop(dataloader, model, loss_fn):
-    # Set the model to evaluation mode - important for batch normalization and dropout layers
-    # Unnecessary in this situation but added for best practices
     model.eval()
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
-    test_loss, correct = 0, 0
+    test_loss = 0
 
-    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
-    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
     with torch.no_grad():
         for X, y in dataloader:
             pred = model(X)
             test_loss += loss_fn(pred, y).item()
-            correct += (pred.argmax(1) == y).type(torch.float).sum().item()
 
     test_loss /= num_batches
-    correct /= size
-    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+    print(f"Test Avg Loss: {test_loss:>8f}")
     
 def readData():
     with open("./Data/chessData.csv", "r") as f:
@@ -135,12 +136,12 @@ def main():
 
     device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
     print(f"Using {device} device")
-    model = ChessNNUE().to(device)
+    model = ChessNNUE().to("cuda")
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     print(model)
 
-    dataset = ChessDataset("chessData.csv")
+    dataset = ChessDataset("chessData.csv", device="cuda")
     df = dataset.__getdataframe__()
     print(df.shape)
 
@@ -159,11 +160,20 @@ def main():
         print("Test batch:", features.shape, evals.shape)
         break
 
-    # run train and test loops
-    train_loop(train_dataloader, model, loss_fn, optimizer, 64)
-    print("\n\n TRAIN LOOP COMPLETE \n\n")
-    test_loop(test_dataloader, model, loss_fn)
-    print("\n\n TEST LOOP COMPLETE \n\n")
+    epochs = 5  # Start small
+    for epoch in range(epochs):
+        print(f"Epoch {epoch+1}\n-------------------------------")
+        train_loop(train_dataloader, model, loss_fn, optimizer, 64)
+        print("\n\n TRAIN LOOP COMPLETE with epoch" + str(epoch+1) + "\n\n")
+        test_loop(test_dataloader, model, loss_fn)
+        print("\n\n TEST LOOP COMPLETE with epoch" + str(epoch+1) + "\n\n")
+    print("Done!")
+
+    # Export for C#
+    torch.save({
+        "accumulator_weights": model.fc1.weight.t() * 255,
+        "output_weights": model.fc2.weight.view(2048) * 255
+    }, "nnue_weights.pt")
 
 
 if __name__ == "__main__":
