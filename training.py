@@ -32,9 +32,6 @@ class ChessDataset(Dataset):
 
         self.chess_labels["eval"] = pd.to_numeric(self.chess_labels["eval"], errors="raise")
 
-        #normalize data
-        self.chess_labels["eval"] = np.sign(self.chess_labels["eval"]) * np.log(1 + np.abs(self.chess_labels["eval"]))
-
         self.transform = transform
         self.target_transform = target_transform
 
@@ -74,7 +71,7 @@ class ChessNNUE(nn.Module):
         self.fc1 = nn.Linear(768, 1024) 
         self.crelu = CReLU() 
         self.fc2 = nn.Linear(2048, 1)
-        self.sigmoid = nn.Sigmoid()
+        #self.sigmoid = nn.Sigmoid()
 
         # self.linear_relu_stack = nn.Sequential(
         #     nn.Linear(768, 1024),
@@ -83,7 +80,7 @@ class ChessNNUE(nn.Module):
     def forward(self, x):
         hidden = self.fc1(x)          # [batch_size, 1024]
         combined = self.crelu(hidden) # [batch_size, 2048]
-        return self.sigmoid(self.fc2(combined))     # [batch_size, 1]
+        return self.fc2(combined)     # [batch_size, 1]
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
@@ -116,7 +113,9 @@ def test_loop(dataloader, model, loss_fn):
             test_loss += loss_fn(pred, y).item()
 
     test_loss /= num_batches
-    print(f"Test Avg Loss: {test_loss:>8f}")
+    loss = f"Test Avg Loss: {test_loss:>8f}"
+    print(test_loss)
+    return loss
     
 def readData():
     with open("./Data/chessData.csv", "r") as f:
@@ -151,7 +150,7 @@ def main():
     df = dataset.__getdataframe__()
     print(df.shape)
 
-    train_size = int(0.95 * len(dataset))
+    train_size = int(0.80 * len(dataset))
     test_size = len(dataset) - train_size
     training_data, test_data = random_split(dataset, [train_size, test_size])
     print(len(training_data), len(test_data))
@@ -166,14 +165,18 @@ def main():
         print("Test batch:", features.shape, evals.shape)
         break
 
-    epochs = 5  # Start small
-    for epoch in range(epochs):
-        print(f"Epoch {epoch+1}\n-------------------------------")
-        train_loop(train_dataloader, model, loss_fn, optimizer, 64)
-        print("\n\n TRAIN LOOP COMPLETE with epoch" + str(epoch+1) + "\n\n")
-        test_loop(test_dataloader, model, loss_fn)
-        print("\n\n TEST LOOP COMPLETE with epoch" + str(epoch+1) + "\n\n")
-    print("Done!")
+
+    with open("averagelossresults.txt", "a") as f:
+        epochs = 20
+        for epoch in range(epochs):
+            print(f"Epoch {epoch+1}\n-------------------------------")
+            train_loop(train_dataloader, model, loss_fn, optimizer, 64)
+            print("\n\n TRAIN LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
+            loss = test_loop(test_dataloader, model, loss_fn)
+            print("\n\n TEST LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
+            f.write(str(loss) + " on epoch " + str(epoch+1) + "\n")
+        print("Done!")
+
 
     # Export for C#
     torch.save({
