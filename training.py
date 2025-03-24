@@ -131,24 +131,21 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
 
 def test_loop(dataloader, model, loss_fn):
     model.eval()  # Set model to evaluation mode
-    #size = len(dataloader.dataset)
 
     total_loss = 0.0
-    count = 0
     num_batches = len(dataloader)
 
     with torch.no_grad():  # Disable gradient tracking for inference
         for X, y in dataloader:
             X, y = X.to("cuda"), y.to("cuda")
             pred = model(X)
-
             loss = loss_fn(pred, y)
-            count += len(y)
-            total_loss += loss
 
-    # Average loss per batch instead of per sample
-    total_loss /= count
-    return total_loss
+            total_loss += loss.item()  # Use .item() to get the scalar value
+
+    # Compute average loss per batch
+    avg_loss = total_loss / num_batches
+    return avg_loss
 
 
 def readData():
