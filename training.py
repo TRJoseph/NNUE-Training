@@ -7,6 +7,7 @@ import os
 from torch.utils.data import DataLoader, Dataset, random_split
 from sklearn.model_selection import train_test_split
 import numpy as np
+from joblib import Parallel, delayed
 
 
 piece_map = {
@@ -14,48 +15,75 @@ piece_map = {
     chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
 }
 
+BATCH_SIZE = 64
+LEARNING_RATE = 0.001
+
 class ChessDataset(Dataset):
-    def __init__(self, chess_positions_file, device="cuda", transform=None, target_transform=None):
-        self.chess_labels = pd.read_csv("./Data/" + chess_positions_file, names=["fen", "eval"], encoding='utf-8')
+    def __init__(self, chess_positions_file, device="cuda", transform=None, target_transform=None, start_idx=0, end_idx=None):
         self.device = device
-
-        # mask for boolean array of every evaluation with checkmate in x number of moves
-        mask = self.chess_labels["eval"].str.contains("#", na=False)
-
-        # this sets the matescore and adds a bias depending on how many moves away from mate it is
-        # for example, "#+4" (mate-in-4 for white) = 10000 + (100/4) = 10025 whereas "#+1" (mate-in-1 for white) = 10000 + (100/1) = 10100
-        # this will hopefully reflect to the NN that a quicker mate is a "better" position
-        ## GOT RID OF THIS ^ FOR NOW AND USING JUST A SIMPLE MATE SCORE FOR A SIDE THAT IS MATING
-        self.chess_labels.loc[mask, "eval"] = self.chess_labels.loc[mask, "eval"].apply(
-           lambda x: 10000 if x == "#+0" else -10000 if x == "#-0" else (10000 if int(x.replace("#", "")) > 0 else -10000)
-        )
-
-        self.chess_labels["eval"] = pd.to_numeric(self.chess_labels["eval"], errors="raise")
-
         self.transform = transform
         self.target_transform = target_transform
 
+        # Load CSV only once
+        self.chess_labels = pd.read_csv("./Data/" + chess_positions_file, names=["fen", "eval"], encoding='utf-8')
+
+        def process_eval(evaluation):
+            if isinstance(evaluation, str) and "#" in evaluation:
+                return -10000 if "-" in evaluation else 10000
+            return float(evaluation)
+
+        self.chess_labels["eval"] = self.chess_labels["eval"].apply(process_eval)
+
+        # Use start_idx and end_idx to slice the dataset
+        if end_idx is None:
+            end_idx = len(self.chess_labels)
+
+        # Extract features and labels for the specific range
+        features = []
+        labels = []
+
+        print(f"\nConverting {str(end_idx-start_idx)} board positions to feature arrays...\n")
+        for idx in range(start_idx, end_idx):
+            fen = self.chess_labels.iloc[idx, 0]
+            evaluation = self.chess_labels.iloc[idx, 1]
+            board = chess.Board(fen)
+            print("Index " + str(idx))
+
+            # Initialize a feature array for the board state
+            feature = np.zeros(774, dtype=np.float32)
+
+            for square, piece in board.piece_map().items():
+                offset = 0 if piece.color == chess.WHITE else 6
+                index = square * 12 + piece_map[piece.piece_type] + offset
+                feature[index] = 1
+
+            # encode the side to move (1 if black's turn, 0 if white's turn)
+            feature[768] = 1 if board.turn == chess.BLACK else 0
+
+            feature[769] = 1 if board.castling_rights & chess.BB_A1 else 0
+            feature[770] = 1 if board.castling_rights & chess.BB_H1 else 0
+            feature[771] = 1 if board.castling_rights & chess.BB_A8 else 0
+            feature[772] = 1 if board.castling_rights & chess.BB_H8 else 0
+
+            # en passant square available
+            feature[773] = 1 if board.ep_square != None else 0
+
+            features.append(feature)
+            labels.append(evaluation)
+
+        print("\nConverting lists to tensors...\n")
+        # Convert lists to numpy arrays and then to tensors
+        self.features = torch.tensor(np.array(features), dtype=torch.float32, device=self.device)
+        self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)  # Reshape to ensure tensor format
+
     def __len__(self):
-        return len(self.chess_labels)
+        return len(self.features)
     
     def __getdataframe__(self):
         return self.chess_labels
     
     def __getitem__(self, idx):
-        fen = self.chess_labels.iloc[idx, 0]
-        evaluation = self.chess_labels.iloc[idx, 1]
-        board = chess.Board(fen)
-        features = [0] * 768
-        for square, piece in chess.Board.piece_map(board).items():
-            # Offset: 0-5 for white, 6-11 for black
-            offset = 0 if piece.color == chess.WHITE else 6
-            index = square * 12 + piece_map[piece.piece_type] + offset
-            features[index] = 1
-        tensor = (
-            torch.tensor(features, dtype=torch.float32, device=self.device),
-            torch.tensor([float(evaluation)], dtype=torch.float32, device=self.device)
-        )
-        return tensor
+            return self.features[idx], self.labels[idx]
 
 class CReLU(nn.Module):
     def __init__(self):
@@ -68,7 +96,7 @@ class ChessNNUE(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.fc1 = nn.Linear(768, 1024) 
+        self.fc1 = nn.Linear(774, 1024) 
         self.crelu = CReLU() 
         self.fc2 = nn.Linear(2048, 1)
         #self.sigmoid = nn.Sigmoid()
@@ -102,21 +130,23 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
             print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
 def test_loop(dataloader, model, loss_fn):
-    model.eval()
+    model.eval()  # Set model to evaluation mode
     size = len(dataloader.dataset)
+    test_loss = 0.0
     num_batches = len(dataloader)
-    test_loss = 0
 
-    with torch.no_grad():
+    with torch.no_grad():  # Disable gradient tracking for inference
         for X, y in dataloader:
+            X, y = X.to("cuda"), y.to("cuda")
             pred = model(X)
             test_loss += loss_fn(pred, y).item()
 
+    # Average loss per batch instead of per sample
     test_loss /= num_batches
-    loss = f"Test Avg Loss: {test_loss:>8f}"
-    print(test_loss)
-    return loss
-    
+    print(f"Test Avg Loss: {test_loss:>8f}")
+    return test_loss
+
+
 def readData():
     with open("./Data/chessData.csv", "r") as f:
         next(f)
@@ -143,21 +173,18 @@ def main():
     print(f"Using {device} device")
     model = ChessNNUE().to("cuda")
     loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     print(model)
 
-    dataset = ChessDataset("chessData.csv", device="cuda")
-    df = dataset.__getdataframe__()
-    print(df.shape)
-
-    train_size = int(0.80 * len(dataset))
-    test_size = len(dataset) - train_size
+    dataset = ChessDataset("chessData.csv", device="cuda", start_idx=0, end_idx=3000000)
+    train_size = int(0.80 * dataset.__len__())
+    test_size = int(dataset.__len__()) - train_size
     training_data, test_data = random_split(dataset, [train_size, test_size])
     print(len(training_data), len(test_data))
 
     # prepares data with dataloader
-    train_dataloader = DataLoader(training_data, batch_size=128, shuffle=True)
-    test_dataloader = DataLoader(test_data, batch_size=128, shuffle=True)
+    train_dataloader = DataLoader(training_data, batch_size=BATCH_SIZE, shuffle=True)
+    test_dataloader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=True)
     for features, evals in train_dataloader:
         print("Train batch:", features.shape, evals.shape)
         break
@@ -165,17 +192,17 @@ def main():
         print("Test batch:", features.shape, evals.shape)
         break
 
-
-    with open("averagelossresults.txt", "a") as f:
-        epochs = 20
-        for epoch in range(epochs):
-            print(f"Epoch {epoch+1}\n-------------------------------")
-            train_loop(train_dataloader, model, loss_fn, optimizer, 64)
-            print("\n\n TRAIN LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
-            loss = test_loop(test_dataloader, model, loss_fn)
-            print("\n\n TEST LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
-            f.write(str(loss) + " on epoch " + str(epoch+1) + "\n")
-        print("Done!")
+    epochs = 1000
+    for epoch in range(epochs):
+        print(f"Epoch {epoch+1}\n-------------------------------")
+        train_loop(train_dataloader, model, loss_fn, optimizer, BATCH_SIZE)
+        print("\n\n TRAIN LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
+        loss = test_loop(test_dataloader, model, loss_fn)
+        centipawn_loss = loss ** 0.5  # Convert to centipawns
+        print("\n\n TEST LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
+        with open("averagelossresultswithenpassant.txt", "a") as f:
+            f.write(f"Epoch {epoch+1}: Loss = {loss} (Centipawns: {centipawn_loss:.2f})\n")
+    print("Done!")
 
 
     # Export for C#
