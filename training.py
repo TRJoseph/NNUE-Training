@@ -27,7 +27,7 @@ class ChessDataset(Dataset):
         self.device = device
         self.transform = transform
         self.target_transform = target_transform
-        self.feature_length = (end_idx - start_idx)
+        self.feature_length = 0
         # all pieces from white's perspective
         self.white_features = []
         # all pieces from black's perspective
@@ -88,6 +88,7 @@ class ChessDataset(Dataset):
         self.black_features = torch.tensor(np.array(self.black_features), dtype=torch.float32, device=self.device)
         self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)  # Reshape for PyTorch
         self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # Convert side to move into tensor
+        self.feature_length = len(self.white_features)
 
 
     def __len__(self):
@@ -243,10 +244,12 @@ def main():
     for epoch in range(epochs):
         print(f"Epoch {epoch+1}\n-------------------------------")
         train_loop(train_dataloader, model, loss_fn, optimizer, BATCH_SIZE)
-        print("\n\n TRAIN LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
+        print("\n\n TRAIN LOOP COMPLETE on Epoch " + str(epoch+1) + "\n\n")
         loss = test_loop(test_dataloader, model, loss_fn)
         loss_values = np.append(loss_values, loss)
-        print("\n\n TEST LOOP COMPLETE on epoch " + str(epoch+1) + "\n\n")
+        print("\n\n TEST LOOP COMPLETE on Epoch " + str(epoch+1) + "\n\n")
+        print("Test Loss on Epoch: " + str(epoch+1) + "\n")
+        print(str(loss))
         with open("AvgLossResults.txt", "a") as f:
             f.write(f"Epoch {epoch+1}: Loss = {loss}\n")
     print("Done!")
@@ -275,15 +278,16 @@ def main():
 
     # export weights
     torch.save({
-        "ft.weight": model.ft.weight.t() * 255,  # [768, 1024]
-        "l1.weight": model.l1.weight.t() * 255,  # [2048, 8]
-        "l2.weight": model.l2.weight.t() * 255,  # [8, 32]
-        "l3.weight": model.l3.weight.t() * 255,  # [32, 1]
-        "ft.bias": model.ft.bias.t() * 255,
+        "ft.weight": model.ft.weight * 255,  # Keep the original shape [768, 1024]
+        "l1.weight": model.l1.weight * 255,  # Keep the original shape [2048, 8]
+        "l2.weight": model.l2.weight * 255,  # Keep the original shape [8, 32]
+        "l3.weight": model.l3.weight * 255,  # Keep the original shape [32, 1]
+        "ft.bias": model.ft.bias * 255,
         "l1.bias": model.l1.bias * 255, 
         "l2.bias": model.l2.bias * 255,
         "l3.bias": model.l3.bias * 255                        
     }, "nnue_weights.pt")
+
 
 
 if __name__ == "__main__":
