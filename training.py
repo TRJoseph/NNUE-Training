@@ -83,11 +83,10 @@ class ChessDataset(Dataset):
             self.stm.append(1 if board.turn == chess.WHITE else 0)  # 1 if White to move, 0 if Black to move
 
         print("\nConverting lists to tensors...\n")
-        # Convert lists to tensors
         self.white_features = torch.tensor(np.array(self.white_features), dtype=torch.float32, device=self.device)
         self.black_features = torch.tensor(np.array(self.black_features), dtype=torch.float32, device=self.device)
-        self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)  # Reshape for PyTorch
-        self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # Convert side to move into tensor
+        self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)
+        self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
         self.feature_length = len(self.white_features)
 
 
@@ -126,7 +125,7 @@ class ChessNNUE(nn.Module):
         w = self.ft(white_features) # white's perspective
         b = self.ft(black_features) # black's perspective
 
-        # Remember that we order the accumulators for 2 perspectives based on who is to move.
+        # we order the accumulators for 2 perspectives based on who is to move.
         # So we blend two possible orderings by interpolating between `stm` and `1-stm` tensors.
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
@@ -138,8 +137,6 @@ class ChessNNUE(nn.Module):
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
-    # Set the model to training mode - important for batch normalization and dropout layers
-    # Unnecessary in this situation but added for best practices
     model.train()
     for batch, (white_features, black_features, stm, target) in enumerate(dataloader):
         white_features, black_features, stm, target = (
@@ -148,11 +145,9 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
             stm.to("cuda"),
             target.to("cuda"),
         )
-        # Forward pass
+
         pred = model(white_features, black_features, stm)
         loss = loss_fn(pred, target)
-
-        # Backpropagation
         loss.backward()
 
         # Check for vanishing or exploding gradients
@@ -168,12 +163,12 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
             print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
 def test_loop(dataloader, model, loss_fn):
-    model.eval()  # Set model to evaluation mode
+    model.eval()
 
     total_loss = 0.0
     num_batches = len(dataloader)
 
-    with torch.no_grad():  # Disable gradient tracking for inference
+    with torch.no_grad():  # disable gradient tracking for inference
         for (white_features, black_features, stm, target) in dataloader:
             white_features, black_features, stm, target = (
                 white_features.to("cuda"),
@@ -184,9 +179,9 @@ def test_loop(dataloader, model, loss_fn):
             pred = model(white_features, black_features, stm)
             loss = loss_fn(pred, target)
 
-            total_loss += loss.item()  # Use .item() to get the scalar value
+            total_loss += loss.item()
 
-    # Compute average loss per batch
+    # computes average loss per batch
     avg_loss = total_loss / num_batches
     return avg_loss
 
