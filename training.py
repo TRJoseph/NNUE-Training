@@ -13,8 +13,8 @@ piece_map = {
 
 BATCH_SIZE = 64
 LEARNING_RATE = 0.0003
-NUM_EPOCHS = 20
-DATASET_SAMPLE_SIZE = 100000
+NUM_EPOCHS = 10
+DATASET_SAMPLE_SIZE = 6000000
 
 HIDDEN_LAYER_SIZE = 1024
 SCALE = 400  
@@ -40,10 +40,9 @@ class ChessDataset(Dataset):
 
         def process_eval(evaluation):
             if "#" in evaluation:
-                evaluation = -10000 if "-" in evaluation else 10000
-
+                evaluation = -2000 if "-" in evaluation else 2000
             return float(evaluation)
-            #return torch.sigmoid(int(evaluation) / SCALE)
+            #return torch.sigmoid(torch.tensor(float(evaluation) / SCALE))
 
         self.chess_labels["eval"] = self.chess_labels["eval"].apply(process_eval)
 
@@ -85,7 +84,7 @@ class ChessDataset(Dataset):
         print("\nConverting lists to tensors...\n")
         self.white_features = torch.tensor(np.array(self.white_features), dtype=torch.float32, device=self.device)
         self.black_features = torch.tensor(np.array(self.black_features), dtype=torch.float32, device=self.device)
-        self.labels = torch.tensor(np.array(labels).reshape(-1, 1),dtype=torch.float32, device=self.device)
+        self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)
         self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
         self.feature_length = len(self.white_features)
 
@@ -109,7 +108,6 @@ def cp_to_wdl(cp):
     return torch.sigmoid(cp / SCALE)
 
 
-    
 class ChessNNUE(nn.Module):
     def __init__(self):
         super(ChessNNUE, self).__init__()
@@ -124,32 +122,32 @@ class ChessNNUE(nn.Module):
         # weight scaling factor
         self.s_W = 64
         # output scaling factor
-        self.s_O = 10000
+        self.s_O = 400
+
+        self.Scale = 10000
 
     # The inputs are a whole batch!
     # `stm` indicates whether white is the side to move. 1 = true, 0 = false.
     def forward(self, white_features, black_features, stm):
-        w = self.ft(white_features) # white's perspective
-        b = self.ft(black_features) # black's perspective
+        w = self.ft(white_features)  # white's perspective
+        b = self.ft(black_features)  # black's perspective
 
         # we order the accumulators for 2 perspectives based on who is to move.
         # So we blend two possible orderings by interpolating between `stm` and `1-stm` tensors.
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
         # Run the linear layers and use clamp_ as ClippedReLU
-        # clip to 127 following stockfish quantization schema, keeping values within int8 activation range
+        # clip to 1.0 following the modified schema for training on raw centipawns
         l1_x = torch.clamp(accumulator, 0.0, self.s_A)
         l2_x = torch.clamp(self.l1(l1_x), 0.0, self.s_A)
         l3_x = torch.clamp(self.l2(l2_x), 0.0, self.s_A)
 
         output = self.l3(l3_x)
-        scaled_output = output * self.s_O
-        
+        scaled_output = output * self.s_O  # Output directly in centipawns
         return scaled_output
-    
 
     ## TODO: FIX THIS, NETWORK PREDICTS PROPERLY WHEN ALL WEIGHTS AND BIASES ARE QUANTIZED TO INT32 VALUES, NEED TO CHANGE SOME WEIGHTS AND BIASES TO INT16/8 FOR MORE FLOPS ON NNUE
-    # I think this is fixed, now the weights and biases can be used as shorts during inference in my chess engine
+    # I think this is fixed, now the weights and biases can be stored as shorts during inference in my chess engine
     def quantize_weights_and_biases(self):
         # int16 for the accumulator because values can go beyond range of int8 before clipped relu
         self.ft_weight_quantized = (self.ft.weight.data * self.s_A).to(torch.int16)  # store quantized weights for inference
@@ -284,7 +282,20 @@ def main():
 
         # export quantized weights
         torch.save({
-            "ft.weight": model.ft_weight_quantized,  # Feature transform weights
+            "ft.weight": model.ft.weight,  
+            "l1.weight": model.l1.weight,
+            "l2.weight": model.l2.weight,
+            "l3.weight": model.l3.weight,
+
+            "ft.bias": model.ft.bias,
+            "l1.bias": model.l1.bias,
+            "l2.bias": model.l2.bias,
+            "l3.bias": model.l3.bias,
+        }, "nnue_weightsNormal.pt")
+
+        # Save quantized weights
+        torch.save({
+            "ft.weight": model.ft_weight_quantized,  
             "l1.weight": model.l1_weight_quantized,
             "l2.weight": model.l2_weight_quantized,
             "l3.weight": model.l3_weight_quantized,
@@ -294,5 +305,6 @@ def main():
             "l2.bias": model.l2_bias_quantized,
             "l3.bias": model.l3_bias_quantized,
         }, "nnue_weightsQuantized.pt")
+
 if __name__ == "__main__":
     main()
