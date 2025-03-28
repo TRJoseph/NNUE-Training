@@ -1,6 +1,5 @@
 import torch
 import chess
-import torch
 import torch.nn as nn
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -15,12 +14,13 @@ piece_map = {
 BATCH_SIZE = 64
 LEARNING_RATE = 0.0003
 NUM_EPOCHS = 20
-DATASET_SAMPLE_SIZE = 2000000
+DATASET_SAMPLE_SIZE = 100000
 
 HIDDEN_LAYER_SIZE = 1024
 SCALE = 400  
 QA = 255
 QB = 64
+
 
 class ChessDataset(Dataset):
     def __init__(self, chess_positions_file, device="cuda", transform=None, target_transform=None, start_idx=0, end_idx=None):
@@ -89,7 +89,6 @@ class ChessDataset(Dataset):
         self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
         self.feature_length = len(self.white_features)
 
-
     def __len__(self):
         return self.feature_length
     
@@ -100,7 +99,8 @@ class ChessDataset(Dataset):
         white_features = self.white_features[idx] 
         black_features = self.black_features[idx]  
         stm = self.stm[idx] 
-        label = cp_to_wdl(self.labels[idx])
+        label = self.labels[idx]
+        #label = cp_to_wdl(self.labels[idx])
         stm = stm.clone().detach().float().unsqueeze(0)
         
         return white_features, black_features, stm, label
@@ -119,6 +119,13 @@ class ChessNNUE(nn.Module):
         self.l2 = nn.Linear(8, 32)
         self.l3 = nn.Linear(32, 1)
 
+        # activation range scaling factor
+        self.s_A = 127
+        # weight scaling factor
+        self.s_W = 64
+        # output scaling factor
+        self.s_O = 10000
+
     # The inputs are a whole batch!
     # `stm` indicates whether white is the side to move. 1 = true, 0 = false.
     def forward(self, white_features, black_features, stm):
@@ -130,10 +137,31 @@ class ChessNNUE(nn.Module):
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
         # Run the linear layers and use clamp_ as ClippedReLU
-        l1_x = torch.clamp(accumulator, 0.0, 1.0)
-        l2_x = torch.clamp(self.l1(l1_x), 0.0, 1.0)
-        l3_x = torch.clamp(self.l2(l2_x), 0.0, 1.0)
-        return self.l3(l3_x)
+        # clip to 127 following stockfish quantization schema, keeping values within int8 activation range
+        l1_x = torch.clamp(accumulator, 0.0, self.s_A)
+        l2_x = torch.clamp(self.l1(l1_x), 0.0, self.s_A)
+        l3_x = torch.clamp(self.l2(l2_x), 0.0, self.s_A)
+
+        output = self.l3(l3_x)
+        scaled_output = output * self.s_O
+        
+        return scaled_output
+    
+
+    ## TODO: FIX THIS, NETWORK PREDICTS PROPERLY WHEN ALL WEIGHTS AND BIASES ARE QUANTIZED TO INT32 VALUES, NEED TO CHANGE SOME WEIGHTS AND BIASES TO INT16/8 FOR MORE FLOPS ON NNUE
+    def quantize_weights_and_biases(self):
+        # int16 for the accumulator because values can go beyond range of int8 before clipped relu
+        self.ft_weight_quantized = (self.ft.weight.data * self.s_A).to(torch.int32)  # store quantized weights for inference
+        self.ft_bias_quantized = (self.ft.bias.data * self.s_A).to(torch.int32)      # store quantized bias for inference
+
+        self.l1_weight_quantized = (self.l1.weight.data * self.s_W).to(torch.int32)
+        self.l1_bias_quantized = (self.l1.bias.data * (self.s_A * self.s_W)).to(torch.int32)
+
+        self.l2_weight_quantized = (self.l2.weight.data * self.s_W).to(torch.int32)
+        self.l2_bias_quantized = (self.l2.bias.data * (self.s_A * self.s_W)).to(torch.int32)
+
+        self.l3_weight_quantized = (self.l3.weight.data * (self.s_W * self.s_O / self.s_A)).to(torch.int32)
+        self.l3_bias_quantized = (self.l3.bias.data * self.s_W * self.s_O).to(torch.int32)
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
@@ -271,19 +299,19 @@ def main():
     plt.tight_layout()
     plt.show()
 
-    # export weights
+    model.quantize_weights_and_biases()
+
+    # export quantized weights
     torch.save({
-        "ft.weight": model.ft.weight * 255,  # Keep the original shape [768, 1024]
-        "l1.weight": model.l1.weight * 255,  # Keep the original shape [2048, 8]
-        "l2.weight": model.l2.weight * 255,  # Keep the original shape [8, 32]
-        "l3.weight": model.l3.weight * 255,  # Keep the original shape [32, 1]
-        "ft.bias": model.ft.bias * 255,
-        "l1.bias": model.l1.bias * 255, 
-        "l2.bias": model.l2.bias * 255,
-        "l3.bias": model.l3.bias * 255                        
-    }, "nnue_weights.pt")
+        "ft.weight": model.ft_weight_quantized,  # Feature transform weights
+        "l1.weight": model.l1_weight_quantized,
+        "l2.weight": model.l2_weight_quantized,
+        "l3.weight": model.l3_weight_quantized,
 
-
-
+        "ft.bias": model.ft_bias_quantized,
+        "l1.bias": model.l1_bias_quantized,
+        "l2.bias": model.l2_bias_quantized,
+        "l3.bias": model.l3_bias_quantized,
+    }, "nnue_weightsQuantized.pt")
 if __name__ == "__main__":
     main()
