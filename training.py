@@ -85,7 +85,7 @@ class ChessDataset(Dataset):
         print("\nConverting lists to tensors...\n")
         self.white_features = torch.tensor(np.array(self.white_features), dtype=torch.float32, device=self.device)
         self.black_features = torch.tensor(np.array(self.black_features), dtype=torch.float32, device=self.device)
-        self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)
+        self.labels = torch.tensor(np.array(labels).reshape(-1, 1),dtype=torch.float32, device=self.device)
         self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
         self.feature_length = len(self.white_features)
 
@@ -149,19 +149,20 @@ class ChessNNUE(nn.Module):
     
 
     ## TODO: FIX THIS, NETWORK PREDICTS PROPERLY WHEN ALL WEIGHTS AND BIASES ARE QUANTIZED TO INT32 VALUES, NEED TO CHANGE SOME WEIGHTS AND BIASES TO INT16/8 FOR MORE FLOPS ON NNUE
+    # I think this is fixed, now the weights and biases can be used as shorts during inference in my chess engine
     def quantize_weights_and_biases(self):
         # int16 for the accumulator because values can go beyond range of int8 before clipped relu
-        self.ft_weight_quantized = (self.ft.weight.data * self.s_A).to(torch.int32)  # store quantized weights for inference
-        self.ft_bias_quantized = (self.ft.bias.data * self.s_A).to(torch.int32)      # store quantized bias for inference
+        self.ft_weight_quantized = (self.ft.weight.data * self.s_A).to(torch.int16)  # store quantized weights for inference
+        self.ft_bias_quantized = (self.ft.bias.data * self.s_A).to(torch.int16)      # store quantized bias for inference
 
-        self.l1_weight_quantized = (self.l1.weight.data * self.s_W).to(torch.int32)
-        self.l1_bias_quantized = (self.l1.bias.data * (self.s_A * self.s_W)).to(torch.int32)
+        self.l1_weight_quantized = (self.l1.weight.data * self.s_W).to(torch.int8)
+        self.l1_bias_quantized = (self.l1.bias.data * (self.s_A * self.s_W)).to(torch.int16)
 
-        self.l2_weight_quantized = (self.l2.weight.data * self.s_W).to(torch.int32)
-        self.l2_bias_quantized = (self.l2.bias.data * (self.s_A * self.s_W)).to(torch.int32)
+        self.l2_weight_quantized = (self.l2.weight.data * self.s_W).to(torch.int8)
+        self.l2_bias_quantized = (self.l2.bias.data * (self.s_A * self.s_W)).to(torch.int16)
 
-        self.l3_weight_quantized = (self.l3.weight.data * (self.s_W * self.s_O / self.s_A)).to(torch.int32)
-        self.l3_bias_quantized = (self.l3.bias.data * self.s_W * self.s_O).to(torch.int32)
+        self.l3_weight_quantized = (self.l3.weight.data * (self.s_W * self.s_O / self.s_A)).to(torch.int16)
+        self.l3_bias_quantized = (self.l3.bias.data * self.s_W * self.s_O).to(torch.int16)
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
@@ -213,105 +214,85 @@ def test_loop(dataloader, model, loss_fn):
     avg_loss = total_loss / num_batches
     return avg_loss
 
-
-def readData():
-    with open("./Data/chessData.csv", "r") as f:
-        next(f)
-        line = f.readline().strip()
-        fen, eval = line.split(",")
-        print(f"FEN: {fen}, Eval: {eval}")
-        return fen
     
-def getDataframe():
-    return pd.read_csv("./Data/chessData.csv", header=None, names=["fen", "eval"], sep=",")
-
-def countLines():
-    with open("./Data/chessData.csv", "r") as f:
-        # Count all lines including header
-        total_lines = sum(1 for line in f)
-        print(f"Total number of lines: {total_lines}")
-        return total_lines
-
-def main():
-    #fen = readData()
-    #createFeatureVector(chess.Board(fen))
-
-    device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+def run_model(dataset, loss_fn=nn.MSELoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+    """Train the ChessNNUE model with the specified loss function, learning rate, batch_size and return the loss values."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device} device")
-    model = ChessNNUE().to("cuda")
-    loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    print(model)
 
-    dataset = ChessDataset("chessData.csv", device="cuda", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
-    train_size = int(0.80 * dataset.__len__())
-    test_size = int(dataset.__len__()) - train_size
+    model = ChessNNUE().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    train_size = int(0.80 * len(dataset))
+    test_size = len(dataset) - train_size
     training_data, test_data = random_split(dataset, [train_size, test_size])
-    print(len(training_data), len(test_data))
 
-    # prepares data with dataloader
-    train_dataloader = DataLoader(training_data, batch_size=BATCH_SIZE, shuffle=True)
-    test_dataloader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=True)
-    # Iterate over training batches
-    for white_features, black_features, stm, evals in train_dataloader:
-        print("Train batch:", white_features.shape, black_features.shape, stm.shape, evals.shape)
-        break
+    train_dataloader = DataLoader(training_data, batch_size=batch_size, shuffle=True)
+    test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
 
-    # Iterate over testing batches
-    for white_features, black_features, stm, evals in test_dataloader:
-        print("Test batch:", white_features.shape, black_features.shape, stm.shape, evals.shape)
-        break
-    loss_values = np.array([])
+    loss_values = []
 
-    epochs = NUM_EPOCHS
-    for epoch in range(epochs):
+    for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch+1}\n-------------------------------")
-        train_loop(train_dataloader, model, loss_fn, optimizer, BATCH_SIZE)
+        train_loop(train_dataloader, model, loss_fn, optimizer, batch_size)
         print("\n\n TRAIN LOOP COMPLETE on Epoch " + str(epoch+1) + "\n\n")
         loss = test_loop(test_dataloader, model, loss_fn)
-        loss_values = np.append(loss_values, loss)
-        print("\n\n TEST LOOP COMPLETE on Epoch " + str(epoch+1) + "\n\n")
-        print("Test Loss on Epoch: " + str(epoch+1) + "\n")
-        print(str(loss))
+        loss_values.append(loss)
+        print(f"Test Loss on Epoch {epoch+1}: {loss}\n")
         with open("AvgLossResults.txt", "a") as f:
             f.write(f"Epoch {epoch+1}: Loss = {loss}\n")
-    print("Done!")
 
+    print("Done!")
+    return model, np.array(loss_values)
+
+def plot_normalized_loss_comparison(dataset):
     epoch_range = np.arange(1, NUM_EPOCHS + 1)
-    # Plot Loss vs Epoch
     plt.figure(figsize=(12, 5))
 
-    plt.subplot(1, 2, 1)
-    plt.plot(epoch_range, loss_values, marker='o', linestyle='-', color='b')
+    for loss_fn, name, color in [
+        (nn.MSELoss(), "MSELoss", 'b'),
+        (nn.SmoothL1Loss(), "SmoothL1Loss", 'r'),
+        (nn.HuberLoss(), "HuberLoss", 'g')
+    ]:
+        model, loss_values = run_model(dataset, loss_fn)
+        normalized_losses = loss_values / loss_values[0]  # Normalize to start at 1
+        plt.plot(epoch_range, normalized_losses, marker='o', linestyle='-', color=color, label=name)
+
+    plt.legend()
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Loss vs. Epoch")
+    plt.ylabel("Normalized Loss")
+    plt.title("Normalized Loss vs. Epoch")
     plt.grid()
-
-    # Plot Loss vs Log(Epoch)
-    plt.subplot(1, 2, 2)
-    plt.plot(np.log(epoch_range), loss_values, marker='o', linestyle='-', color='r')
-    plt.xlabel("log(Epoch)")
-    plt.ylabel("Loss")
-    plt.title("Loss vs. log(Epoch)")
-    plt.grid()
-
     plt.tight_layout()
     plt.show()
 
-    model.quantize_weights_and_biases()
+    return model
 
-    # export quantized weights
-    torch.save({
-        "ft.weight": model.ft_weight_quantized,  # Feature transform weights
-        "l1.weight": model.l1_weight_quantized,
-        "l2.weight": model.l2_weight_quantized,
-        "l3.weight": model.l3_weight_quantized,
+def main():
+    print("Loading Dataset...\n")
+    dataset = ChessDataset("chessData.csv", device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
+    print("Dataset Initialized!\n")   
+    model = None
 
-        "ft.bias": model.ft_bias_quantized,
-        "l1.bias": model.l1_bias_quantized,
-        "l2.bias": model.l2_bias_quantized,
-        "l3.bias": model.l3_bias_quantized,
-    }, "nnue_weightsQuantized.pt")
+    #model = plot_normalized_loss_comparison(dataset)
+
+    model, loss_values = run_model(dataset, nn.MSELoss())
+
+    if model is not None:
+        ## quantizes weights and biases for use as NNUE
+        model.quantize_weights_and_biases()
+
+        # export quantized weights
+        torch.save({
+            "ft.weight": model.ft_weight_quantized,  # Feature transform weights
+            "l1.weight": model.l1_weight_quantized,
+            "l2.weight": model.l2_weight_quantized,
+            "l3.weight": model.l3_weight_quantized,
+
+            "ft.bias": model.ft_bias_quantized,
+            "l1.bias": model.l1_bias_quantized,
+            "l2.bias": model.l2_bias_quantized,
+            "l3.bias": model.l3_bias_quantized,
+        }, "nnue_weightsQuantized2.pt")
 if __name__ == "__main__":
     main()
