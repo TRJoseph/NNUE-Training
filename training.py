@@ -293,6 +293,6 @@ def main():
             "l1.bias": model.l1_bias_quantized,
             "l2.bias": model.l2_bias_quantized,
             "l3.bias": model.l3_bias_quantized,
-        }, "nnue_weightsQuantized2.pt")
+        }, "nnue_weightsQuantized.pt")
 if __name__ == "__main__":
     main()
