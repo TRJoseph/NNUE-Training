@@ -13,13 +13,14 @@ piece_map = {
 
 BATCH_SIZE = 64
 LEARNING_RATE = 0.0003
-NUM_EPOCHS = 10
-DATASET_SAMPLE_SIZE = 6000000
+NUM_EPOCHS = 20
+DATASET_SAMPLE_SIZE = 100000
 
 HIDDEN_LAYER_SIZE = 1024
-SCALE = 400  
 QA = 255
 QB = 64
+# output scaling factor
+QO = 400  
 
 
 class ChessDataset(Dataset):
@@ -105,7 +106,7 @@ class ChessDataset(Dataset):
         return white_features, black_features, stm, label
     
 def cp_to_wdl(cp):
-    return torch.sigmoid(cp / SCALE)
+    return torch.sigmoid(cp / QO)
 
 
 class ChessNNUE(nn.Module):
@@ -117,14 +118,13 @@ class ChessNNUE(nn.Module):
         self.l2 = nn.Linear(8, 32)
         self.l3 = nn.Linear(32, 1)
 
-        # activation range scaling factor
+        # activation range scaling factor (yoinked from stockfish quantization schema)
         self.s_A = 127
-        # weight scaling factor
-        self.s_W = 64
-        # output scaling factor
-        self.s_O = 400
 
-        self.Scale = 10000
+        # scaling factors for quantization and activation
+        self.QA = 255 
+        self.QB = 64
+        self.QO = 400 
 
     # The inputs are a whole batch!
     # `stm` indicates whether white is the side to move. 1 = true, 0 = false.
@@ -136,31 +136,29 @@ class ChessNNUE(nn.Module):
         # So we blend two possible orderings by interpolating between `stm` and `1-stm` tensors.
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
-        # Run the linear layers and use clamp_ as ClippedReLU
-        # clip to 1.0 following the modified schema for training on raw centipawns
+        # runs the linear layers and use clamp as ClippedReLU
+        # clip to 127.0 following stockfish schema
         l1_x = torch.clamp(accumulator, 0.0, self.s_A)
         l2_x = torch.clamp(self.l1(l1_x), 0.0, self.s_A)
         l3_x = torch.clamp(self.l2(l2_x), 0.0, self.s_A)
 
         output = self.l3(l3_x)
-        scaled_output = output * self.s_O  # Output directly in centipawns
-        return scaled_output
-
-    ## TODO: FIX THIS, NETWORK PREDICTS PROPERLY WHEN ALL WEIGHTS AND BIASES ARE QUANTIZED TO INT32 VALUES, NEED TO CHANGE SOME WEIGHTS AND BIASES TO INT16/8 FOR MORE FLOPS ON NNUE
+        return output
+    
     # I think this is fixed, now the weights and biases can be stored as shorts during inference in my chess engine
+    # rounding causes some precision loss on the forward pass, but the gains in performance using FP8 and FP16 compute makes up for the loss
     def quantize_weights_and_biases(self):
-        # int16 for the accumulator because values can go beyond range of int8 before clipped relu
-        self.ft_weight_quantized = (self.ft.weight.data * self.s_A).to(torch.int16)  # store quantized weights for inference
-        self.ft_bias_quantized = (self.ft.bias.data * self.s_A).to(torch.int16)      # store quantized bias for inference
-
-        self.l1_weight_quantized = (self.l1.weight.data * self.s_W).to(torch.int8)
-        self.l1_bias_quantized = (self.l1.bias.data * (self.s_A * self.s_W)).to(torch.int16)
-
-        self.l2_weight_quantized = (self.l2.weight.data * self.s_W).to(torch.int8)
-        self.l2_bias_quantized = (self.l2.bias.data * (self.s_A * self.s_W)).to(torch.int16)
-
-        self.l3_weight_quantized = (self.l3.weight.data * (self.s_W * self.s_O / self.s_A)).to(torch.int16)
-        self.l3_bias_quantized = (self.l3.bias.data * self.s_W * self.s_O).to(torch.int16)
+        self.ft_weight_quantized = (self.ft.weight.data * QA).round().to(torch.int16)
+        self.ft_bias_quantized = (self.ft.bias.data * QA).round().to(torch.int16)
+        
+        self.l1_weight_quantized = (self.l1.weight.data * QB).round().to(torch.int8)
+        self.l1_bias_quantized = (self.l1.bias.data * QB).round().to(torch.int16)
+        
+        self.l2_weight_quantized = (self.l2.weight.data * QB).round().to(torch.int8)
+        self.l2_bias_quantized = (self.l2.bias.data * QB).round().to(torch.int16)
+        
+        self.l3_weight_quantized = (self.l3.weight.data * QB).round().to(torch.int16)
+        self.l3_bias_quantized = (self.l3.bias.data * QO).round().to(torch.int16)
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
     size = len(dataloader.dataset)
@@ -213,7 +211,7 @@ def test_loop(dataloader, model, loss_fn):
     return avg_loss
 
     
-def run_model(dataset, loss_fn=nn.MSELoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
     """Train the ChessNNUE model with the specified loss function, learning rate, batch_size and return the loss values."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device} device")
@@ -268,7 +266,8 @@ def plot_normalized_loss_comparison(dataset):
 
 def main():
     print("Loading Dataset...\n")
-    dataset = ChessDataset("chessData.csv", device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
+    # torch.device("cuda" if torch.cuda.is_available() else "cpu"
+    dataset = ChessDataset("chessData.csv", device="cpu", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
     print("Dataset Initialized!\n")   
     model = None
 
