@@ -5,6 +5,7 @@ import pandas as pd
 from torch.utils.data import DataLoader, Dataset, random_split
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 # default model configuration
 BATCH_SIZE = 64
@@ -364,6 +365,8 @@ def main():
     # plots relative normalized losses with different loss functions, learning rates, and batch sizes
     #model = plot_normalized_loss_comparison(dataset)
 
+    save_dir = "weights"
+
     if model is not None:
         ## quantizes weights and biases for use as NNUE
         model.quantize_weights_and_biases()
@@ -379,7 +382,7 @@ def main():
             "l1.bias": model.l1.bias,
             "l2.bias": model.l2.bias,
             "l3.bias": model.l3.bias,
-        }, "nnue_weightsNormal.pt")
+        }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
 
         # Save quantized weights
         torch.save({
@@ -392,7 +395,7 @@ def main():
             "l1.bias": model.l1_bias_quantized,
             "l2.bias": model.l2_bias_quantized,
             "l3.bias": model.l3_bias_quantized,
-        }, "nnue_weightsQuantized.pt")
+        }, os.path.join(save_dir, "nnue_weightsQuantized.pt"))
 
 if __name__ == "__main__":
     main()
