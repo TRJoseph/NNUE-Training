@@ -1,26 +1,26 @@
 import torch
 import chess
-import torch
 import torch.nn as nn
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset, random_split
 import numpy as np
 import matplotlib.pyplot as plt
 
-piece_map = {
-    chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-    chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
-}
-
+# default model configuration
 BATCH_SIZE = 64
-LEARNING_RATE = 0.0003
-NUM_EPOCHS = 20
-DATASET_SAMPLE_SIZE = 2000000
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 10
+DATASET_SAMPLE_SIZE = 100000
+
+# mate score in centipawns, this may be worth looking at for increasing model performance
+DEFAULT_MATE_SCORE = 5000
 
 HIDDEN_LAYER_SIZE = 1024
-SCALE = 400  
 QA = 255
 QB = 64
+# output scaling factor
+QO = 400  
+
 
 class ChessDataset(Dataset):
     def __init__(self, chess_positions_file, device="cuda", transform=None, target_transform=None, start_idx=0, end_idx=None):
@@ -40,19 +40,23 @@ class ChessDataset(Dataset):
 
         def process_eval(evaluation):
             if "#" in evaluation:
-                evaluation = -10000 if "-" in evaluation else 10000
-
+                evaluation = -DEFAULT_MATE_SCORE if "-" in evaluation else DEFAULT_MATE_SCORE
             return float(evaluation)
-            #return torch.sigmoid(int(evaluation) / SCALE)
+            #return torch.sigmoid(torch.tensor(float(evaluation) / SCALE))
 
         self.chess_labels["eval"] = self.chess_labels["eval"].apply(process_eval)
 
-        # Use start_idx and end_idx to slice the dataset
+        # this allows the program to grow or shrink the sample set from the dataset instead of using every single position found in the file
         if end_idx is None:
             end_idx = len(self.chess_labels)
 
-        # Extract features and labels for the specific range
+        # keeps track of labels for later use
         labels = []
+
+        piece_map = {
+            chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+            chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
+        }
 
         print(f"\nConverting {str(end_idx - start_idx)} board positions to feature arrays...\n")
         for idx in range(start_idx, end_idx):
@@ -89,7 +93,6 @@ class ChessDataset(Dataset):
         self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
         self.feature_length = len(self.white_features)
 
-
     def __len__(self):
         return self.feature_length
     
@@ -100,16 +103,21 @@ class ChessDataset(Dataset):
         white_features = self.white_features[idx] 
         black_features = self.black_features[idx]  
         stm = self.stm[idx] 
-        label = cp_to_wdl(self.labels[idx])
+
+        raw_label = self.labels[idx]
+        sigmoid_label = cp_to_wdl(raw_label)
         stm = stm.clone().detach().float().unsqueeze(0)
         
-        return white_features, black_features, stm, label
+        return white_features, black_features, stm, sigmoid_label, raw_label
     
 def cp_to_wdl(cp):
-    return torch.sigmoid(cp / SCALE)
+    return torch.sigmoid(cp / QO)
 
+def wdl_to_cp(wdl):
+    # Avoid extreme values by clamping
+    wdl_clamped = torch.clamp(wdl, 0.001, 0.999)
+    return -QO * torch.log((1 / wdl_clamped) - 1)
 
-    
 class ChessNNUE(nn.Module):
     def __init__(self):
         super(ChessNNUE, self).__init__()
@@ -119,36 +127,88 @@ class ChessNNUE(nn.Module):
         self.l2 = nn.Linear(8, 32)
         self.l3 = nn.Linear(32, 1)
 
+        # activation range scaling factor (yoinked from stockfish quantization schema)
+        self.s_A = 127
+
+        # scaling factors for quantization and activation
+        self.QA = 255 
+        self.QB = 64
+        self.QO = 400 
+
+        nn.init.xavier_uniform_(self.ft.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.l1.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.l2.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.l3.weight, gain=0.01)
+        
+        # Initialize biases to small values
+        nn.init.zeros_(self.ft.bias)
+        nn.init.zeros_(self.l1.bias)
+        nn.init.zeros_(self.l2.bias)
+        nn.init.zeros_(self.l3.bias)
+
+
     # The inputs are a whole batch!
     # `stm` indicates whether white is the side to move. 1 = true, 0 = false.
-    def forward(self, white_features, black_features, stm):
-        w = self.ft(white_features) # white's perspective
-        b = self.ft(black_features) # black's perspective
+    def forward(self, white_features, black_features, stm, inference=False):
+        w = self.ft(white_features)  # white's perspective
+        b = self.ft(black_features)  # black's perspective
 
         # we order the accumulators for 2 perspectives based on who is to move.
         # So we blend two possible orderings by interpolating between `stm` and `1-stm` tensors.
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
-        # Run the linear layers and use clamp_ as ClippedReLU
-        l1_x = torch.clamp(accumulator, 0.0, 1.0)
-        l2_x = torch.clamp(self.l1(l1_x), 0.0, 1.0)
-        l3_x = torch.clamp(self.l2(l2_x), 0.0, 1.0)
-        return self.l3(l3_x)
+        # runs the linear layers and use clamp as ClippedReLU
+        # clip to 127.0 following stockfish schema
+        l1_x = torch.clamp(accumulator, 0.0, self.s_A)
+        l2_x = torch.clamp(self.l1(l1_x), 0.0, self.s_A)
+        l3_x = torch.clamp(self.l2(l2_x), 0.0, self.s_A)
+
+        raw_output = self.l3(l3_x)
+
+        # During inference, this would be replaced with scaling
+        if inference:
+            # this output is with the scaling factor applied, in TigerEngine, the only code in the forward pass will be inference (obviously)
+            output = raw_output * self.QO
+            return output, raw_output
+            
+        output = torch.sigmoid(raw_output)
+
+        return output, raw_output
     
-def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
+    # I think this is fixed, now the weights and biases can be stored as shorts during inference in my chess engine
+    # rounding causes some precision loss on the forward pass, but the gains in performance using FP8 and FP16 compute makes up for the loss
+    def quantize_weights_and_biases(self):
+        self.ft_weight_quantized = (self.ft.weight.data * QA).round().to(torch.int16)
+        self.ft_bias_quantized = (self.ft.bias.data * QA).round().to(torch.int16)
+        
+        self.l1_weight_quantized = (self.l1.weight.data * QB).round().to(torch.int8)
+        self.l1_bias_quantized = (self.l1.bias.data * QB).round().to(torch.int16)
+        
+        self.l2_weight_quantized = (self.l2.weight.data * QB).round().to(torch.int8)
+        self.l2_bias_quantized = (self.l2.bias.data * QB).round().to(torch.int16)
+        
+        self.l3_weight_quantized = (self.l3.weight.data * QB).round().to(torch.int16)
+        self.l3_bias_quantized = (self.l3.bias.data * QO).round().to(torch.int16)
+    
+def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
     size = len(dataloader.dataset)
     model.train()
-    for batch, (white_features, black_features, stm, target) in enumerate(dataloader):
-        white_features, black_features, stm, target = (
+    running_loss = 0.0
+    for batch, (white_features, black_features, stm, target, raw_eval) in enumerate(dataloader):
+        white_features, black_features, stm, target, raw_eval = (
             white_features.to("cuda"),
             black_features.to("cuda"),
             stm.to("cuda"),
             target.to("cuda"),
+            raw_eval.to("cuda"),
         )
 
-        pred = model(white_features, black_features, stm)
-        loss = loss_fn(pred, target)
+        pred_sigmoid, pred_raw = model(white_features, black_features, stm)
+        loss = loss_fn(pred_sigmoid, target)
         loss.backward()
+
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # Check for vanishing or exploding gradients
         # for param in model.parameters():
@@ -158,132 +218,181 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size):
         optimizer.step()
         optimizer.zero_grad()
 
+        running_loss += loss.item()
+
         if batch % 100 == 0:
             loss, current = loss.item(), batch * batch_size + len(white_features)
             print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
+         # Early in training, print some evaluations
+        if epoch <= 1 and batch % 500 == 0:
+            with torch.no_grad():
+                # For visualization, convert sigmoid back to centipawn
+                pred_cp = wdl_to_cp(pred_sigmoid[:3])
+                for i in range(3):
+                    print(f"  Sample {i}: Pred CP: {pred_cp[i].item():.1f}, Actual CP: {raw_eval[i].item():.1f}")
+
+    return running_loss / len(dataloader)
+    
+
 def test_loop(dataloader, model, loss_fn):
     model.eval()
-
     total_loss = 0.0
-    num_batches = len(dataloader)
-
-    with torch.no_grad():  # disable gradient tracking for inference
-        for (white_features, black_features, stm, target) in dataloader:
-            white_features, black_features, stm, target = (
+    total_mae = 0.0
+    num_samples = 0
+    
+    with torch.no_grad():
+        for (white_features, black_features, stm, target, raw_eval) in dataloader:
+            white_features, black_features, stm, target, raw_eval = (
                 white_features.to("cuda"),
                 black_features.to("cuda"),
                 stm.to("cuda"),
                 target.to("cuda"),
+                raw_eval.to("cuda"),
             )
-            pred = model(white_features, black_features, stm)
-            loss = loss_fn(pred, target)
+            
+            pred_sigmoid, pred_raw = model(white_features, black_features, stm)
+            
+            # loss is on the sigmoid values 
+            loss = loss_fn(pred_sigmoid, target)
+            total_loss += loss.item() * len(white_features)
+            
+            pred_cp = wdl_to_cp(pred_sigmoid)
+            mae = torch.abs(pred_cp - raw_eval).mean().item()
+            
+            total_mae += mae * len(white_features)
+            num_samples += len(white_features)
 
-            total_loss += loss.item()
+    # return loss and MAE
+    return total_loss / num_samples, total_mae / num_samples
 
-    # computes average loss per batch
-    avg_loss = total_loss / num_batches
-    return avg_loss
-
-
-def readData():
-    with open("./Data/chessData.csv", "r") as f:
-        next(f)
-        line = f.readline().strip()
-        fen, eval = line.split(",")
-        print(f"FEN: {fen}, Eval: {eval}")
-        return fen
     
-def getDataframe():
-    return pd.read_csv("./Data/chessData.csv", header=None, names=["fen", "eval"], sep=",")
-
-def countLines():
-    with open("./Data/chessData.csv", "r") as f:
-        # Count all lines including header
-        total_lines = sum(1 for line in f)
-        print(f"Total number of lines: {total_lines}")
-        return total_lines
-
-def main():
-    #fen = readData()
-    #createFeatureVector(chess.Board(fen))
-
-    device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+def run_model(dataset, loss_fn=nn.MSELoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device} device")
-    model = ChessNNUE().to("cuda")
-    loss_fn = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    print(model)
 
-    dataset = ChessDataset("chessData.csv", device="cuda", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
-    train_size = int(0.80 * dataset.__len__())
-    test_size = int(dataset.__len__()) - train_size
-    training_data, test_data = random_split(dataset, [train_size, test_size])
-    print(len(training_data), len(test_data))
+    # initialize model and optimizer
+    model = ChessNNUE().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # prepares data with dataloader
-    train_dataloader = DataLoader(training_data, batch_size=BATCH_SIZE, shuffle=True)
-    test_dataloader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=True)
-    # Iterate over training batches
-    for white_features, black_features, stm, evals in train_dataloader:
-        print("Train batch:", white_features.shape, black_features.shape, stm.shape, evals.shape)
-        break
+    # splits dataset into training and test sets
+    train_size = int(0.80 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_data, test_data = random_split(dataset, [train_size, test_size])
 
-    # Iterate over testing batches
-    for white_features, black_features, stm, evals in test_dataloader:
-        print("Test batch:", white_features.shape, black_features.shape, stm.shape, evals.shape)
-        break
-    loss_values = np.array([])
+    train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
 
-    epochs = NUM_EPOCHS
-    for epoch in range(epochs):
-        print(f"Epoch {epoch+1}\n-------------------------------")
-        train_loop(train_dataloader, model, loss_fn, optimizer, BATCH_SIZE)
-        print("\n\n TRAIN LOOP COMPLETE on Epoch " + str(epoch+1) + "\n\n")
-        loss = test_loop(test_dataloader, model, loss_fn)
-        loss_values = np.append(loss_values, loss)
-        print("\n\n TEST LOOP COMPLETE on Epoch " + str(epoch+1) + "\n\n")
-        print("Test Loss on Epoch: " + str(epoch+1) + "\n")
-        print(str(loss))
+    # lists to store losses for plotting
+    train_losses = []
+    test_losses = []
+
+    # Training loop over epochs
+    for epoch in range(NUM_EPOCHS):
+        print(f"Epoch {epoch + 1}\n-------------------------------")
+        
+        # training loss
+        train_loss = train_loop(train_dataloader, model, loss_fn, optimizer, batch_size, epoch)
+        train_losses.append(train_loss)
+        print(f"\nTRAIN LOOP COMPLETE on Epoch {epoch + 1}\nAverage Train Loss: {train_loss:.6f}\n")
+
+        # test loss
+        test_loss, test_mae = test_loop(test_dataloader, model, loss_fn)
+        test_losses.append(test_loss)
+        print(f"Validation after Epoch {epoch + 1}\nAverage Test Loss: {test_loss:.6f}, MAE: {test_mae:.6f}\n")
+
         with open("AvgLossResults.txt", "a") as f:
-            f.write(f"Epoch {epoch+1}: Loss = {loss}\n")
-    print("Done!")
+            f.write(f"Epoch {epoch + 1}: Train Loss = {train_loss:.6f}, Test Loss = {test_loss:.6f}, MAE = {test_mae:.6f}\n")
 
+    print("Training Done!")
+    return model, train_losses, test_losses
+
+def plot_normalized_loss_comparison(dataset):
     epoch_range = np.arange(1, NUM_EPOCHS + 1)
-    # Plot Loss vs Epoch
     plt.figure(figsize=(12, 5))
 
-    plt.subplot(1, 2, 1)
-    plt.plot(epoch_range, loss_values, marker='o', linestyle='-', color='b')
+    for loss_fn, name, color in [
+        (nn.MSELoss(), "MSELoss", 'b'),
+        (nn.SmoothL1Loss(), "SmoothL1Loss", 'r'),
+        (nn.HuberLoss(), "HuberLoss", 'g')
+    ]:
+        model, train_losses, test_losses = run_model(dataset, loss_fn)
+        normalized_losses = test_losses / test_losses[0]  # Normalize to start at 1
+        plt.plot(epoch_range, normalized_losses, marker='o', linestyle='-', color=color, label=name)
+
+    plt.legend()
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Loss vs. Epoch")
+    plt.ylabel("Normalized Loss")
+    plt.title("Normalized Loss vs. Epoch")
     plt.grid()
-
-    # Plot Loss vs Log(Epoch)
-    plt.subplot(1, 2, 2)
-    plt.plot(np.log(epoch_range), loss_values, marker='o', linestyle='-', color='r')
-    plt.xlabel("log(Epoch)")
-    plt.ylabel("Loss")
-    plt.title("Loss vs. log(Epoch)")
-    plt.grid()
-
     plt.tight_layout()
     plt.show()
 
-    # export weights
-    torch.save({
-        "ft.weight": model.ft.weight * 255,  # Keep the original shape [768, 1024]
-        "l1.weight": model.l1.weight * 255,  # Keep the original shape [2048, 8]
-        "l2.weight": model.l2.weight * 255,  # Keep the original shape [8, 32]
-        "l3.weight": model.l3.weight * 255,  # Keep the original shape [32, 1]
-        "ft.bias": model.ft.bias * 255,
-        "l1.bias": model.l1.bias * 255, 
-        "l2.bias": model.l2.bias * 255,
-        "l3.bias": model.l3.bias * 255                        
-    }, "nnue_weights.pt")
+    return model
+
+def plot_normalized_test_versus_train_loss(train_losses, test_losses):
+    epoch_range = np.arange(1, NUM_EPOCHS + 1)
+
+    # normalize to start at 1 to get an idea of the relative performance
+    normalized_train_losses = train_losses / train_losses[0]
+    normalized_test_losses =  test_losses / test_losses[0]
+    plt.figure(figsize=(12, 5))
+    plt.plot(epoch_range, normalized_train_losses, marker='o', linestyle='-', color='r', label="Training Loss")
+    plt.plot(epoch_range, normalized_test_losses, marker='o', linestyle='-', color='g', label="Test Loss")
+
+    plt.legend()
+    plt.xlabel("Epoch")
+    plt.ylabel("Normalized Loss")
+    plt.title("Normalized Loss vs. Epoch")
+    plt.grid()
+    plt.tight_layout()
+    plt.show()
 
 
+def main():
+    print("Loading Dataset...\n")
+    # torch.device("cuda" if torch.cuda.is_available() else "cpu"
+    dataset = ChessDataset("chessData.csv", device="cpu", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
+    print("Dataset Initialized!\n")   
+    model = None
+
+    model, train_losses, test_losses = run_model(dataset)
+
+    # plots test and training loss to give an idea of model performance with the default global configuration (found at the top)
+    plot_normalized_test_versus_train_loss(train_losses, test_losses)
+
+    # plots relative normalized losses with different loss functions, learning rates, and batch sizes
+    #model = plot_normalized_loss_comparison(dataset)
+
+    if model is not None:
+        ## quantizes weights and biases for use as NNUE
+        model.quantize_weights_and_biases()
+
+        # export quantized weights
+        torch.save({
+            "ft.weight": model.ft.weight,  
+            "l1.weight": model.l1.weight,
+            "l2.weight": model.l2.weight,
+            "l3.weight": model.l3.weight,
+
+            "ft.bias": model.ft.bias,
+            "l1.bias": model.l1.bias,
+            "l2.bias": model.l2.bias,
+            "l3.bias": model.l3.bias,
+        }, "nnue_weightsNormal.pt")
+
+        # Save quantized weights
+        torch.save({
+            "ft.weight": model.ft_weight_quantized,  
+            "l1.weight": model.l1_weight_quantized,
+            "l2.weight": model.l2_weight_quantized,
+            "l3.weight": model.l3_weight_quantized,
+
+            "ft.bias": model.ft_bias_quantized,
+            "l1.bias": model.l1_bias_quantized,
+            "l2.bias": model.l2_bias_quantized,
+            "l3.bias": model.l3_bias_quantized,
+        }, "nnue_weightsQuantized.pt")
 
 if __name__ == "__main__":
     main()
