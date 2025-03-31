@@ -16,7 +16,7 @@ QB = 64
 SCALE = 400
 
 model = training.ChessNNUE()
-weights = torch.load("nnue_weightsNormal.pt") 
+weights = torch.load("nnue_weightsQuantized.pt") 
 # state_dict = {
 #     "ft.weight": weights["ft.weight"] / S_A,  # Dequantize from 127
 #     "l1.weight": weights["l1.weight"] / S_W,  # Correct (64)
@@ -30,34 +30,34 @@ weights = torch.load("nnue_weightsNormal.pt")
 
 
 ### undo quantization scaling for state dict
-# state_dict = {
-#     # Feature transformer layer
-#     "ft.weight": weights["ft.weight"].float() / QA,
-#     "ft.bias": weights["ft.bias"].float() / QA,
-    
-#     # Layer 1
-#     "l1.weight": weights["l1.weight"].float() / QB,
-#     "l1.bias": weights["l1.bias"].float() / QB,
-    
-#     # Layer 2
-#     "l2.weight": weights["l2.weight"].float() / QB,
-#     "l2.bias": weights["l2.bias"].float() / QB,
-    
-#     # Output layer
-#     "l3.weight": weights["l3.weight"].float() / QB,
-#     "l3.bias": weights["l3.bias"].float() / SCALE,
-# }
-
 state_dict = {
-    "ft.weight": weights["ft.weight"] ,
-    "l1.weight": weights["l1.weight"],
-    "l2.weight": weights["l2.weight"] ,
-    "l3.weight": weights["l3.weight"] ,
-    "ft.bias": weights["ft.bias"] ,
-    "l1.bias": weights["l1.bias"] ,
-    "l2.bias": weights["l2.bias"] ,
-    "l3.bias": weights["l3.bias"] ,
+    # Feature transformer layer
+    "ft.weight": weights["ft.weight"].float() / QA,
+    "ft.bias": weights["ft.bias"].float() / QA,
+    
+    # Layer 1
+    "l1.weight": weights["l1.weight"].float() / QB,
+    "l1.bias": weights["l1.bias"].float() / QB,
+    
+    # Layer 2
+    "l2.weight": weights["l2.weight"].float() / QB,
+    "l2.bias": weights["l2.bias"].float() / QB,
+    
+    # Output layer
+    "l3.weight": weights["l3.weight"].float() / QB,
+    "l3.bias": weights["l3.bias"].float() / SCALE,
 }
+
+# state_dict = {
+#     "ft.weight": weights["ft.weight"] ,
+#     "l1.weight": weights["l1.weight"],
+#     "l2.weight": weights["l2.weight"] ,
+#     "l3.weight": weights["l3.weight"] ,
+#     "ft.bias": weights["ft.bias"] ,
+#     "l1.bias": weights["l1.bias"] ,
+#     "l2.bias": weights["l2.bias"] ,
+#     "l3.bias": weights["l3.bias"] ,
+# }
 
 model.load_state_dict(state_dict)
 model.eval()
@@ -100,8 +100,8 @@ for i in range(0, len(fenList)):
     white_feature, black_feature, stm = fen_to_tensor(fenList[i])
     # Make Prediction
     with torch.no_grad():
-        output = model(white_feature, black_feature, stm).item()
+        pred_output, pred_raw = model(white_feature, black_feature, stm, True)
 
     print(f"Position {i+1} with Stockfish evaluation: {evaluations[i]}\n")
-    print(f"♟️ Chess NNUE Evaluation: {output:.3f}\n")
+    print(f"♟️ Chess NNUE Evaluation: {pred_output.item():.3f}\n")
 
