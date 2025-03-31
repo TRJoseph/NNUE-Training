@@ -166,7 +166,7 @@ class ChessNNUE(nn.Module):
 
         raw_output = self.l3(l3_x)
 
-        # During inference, this would be replaced with scaling
+        # during inference, scale output instead of passing evaluation through sigmoid
         if inference:
             # this output is with the scaling factor applied, in TigerEngine, the only code in the forward pass will be inference (obviously)
             output = raw_output * self.QO
