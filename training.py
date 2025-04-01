@@ -9,9 +9,9 @@ import os
 
 # default model configuration
 BATCH_SIZE = 64
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0003
 NUM_EPOCHS = 10
-DATASET_SAMPLE_SIZE = 100000
+DATASET_SAMPLE_SIZE = None
 
 # mate score in centipawns, this may be worth looking at for increasing model performance
 DEFAULT_MATE_SCORE = 5000
@@ -334,6 +334,9 @@ def plot_normalized_loss_comparison(dataset):
 def plot_normalized_test_versus_train_loss(train_losses, test_losses):
     epoch_range = np.arange(1, NUM_EPOCHS + 1)
 
+    train_losses = np.array(train_losses, dtype=np.float64)
+    test_losses = np.array(test_losses, dtype=np.float64)
+
     # normalize to start at 1 to get an idea of the relative performance
     normalized_train_losses = train_losses / train_losses[0]
     normalized_test_losses =  test_losses / test_losses[0]
@@ -360,7 +363,7 @@ def main():
     model, train_losses, test_losses = run_model(dataset)
 
     # plots test and training loss to give an idea of model performance with the default global configuration (found at the top)
-    plot_normalized_test_versus_train_loss(train_losses, test_losses)
+    #plot_normalized_test_versus_train_loss(train_losses, test_losses)
 
     # plots relative normalized losses with different loss functions, learning rates, and batch sizes
     #model = plot_normalized_loss_comparison(dataset)
@@ -371,7 +374,7 @@ def main():
         ## quantizes weights and biases for use as NNUE
         model.quantize_weights_and_biases()
 
-        # export quantized weights
+        # export normal weights
         torch.save({
             "ft.weight": model.ft.weight,  
             "l1.weight": model.l1.weight,
@@ -384,7 +387,7 @@ def main():
             "l3.bias": model.l3.bias,
         }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
 
-        # Save quantized weights
+        # export quantized weights
         torch.save({
             "ft.weight": model.ft_weight_quantized,  
             "l1.weight": model.l1_weight_quantized,
