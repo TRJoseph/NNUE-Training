@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import os
 
 # default model configuration
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 LEARNING_RATE = 0.0003
 NUM_EPOCHS = 10
 DATASET_SAMPLE_SIZE = None
@@ -17,7 +17,7 @@ DATASET_SAMPLE_SIZE = None
 DEFAULT_MATE_SCORE = 5000
 
 HIDDEN_LAYER_SIZE = 1024
-QA = 255
+QA = 127
 QB = 64
 # output scaling factor
 QO = 400  
@@ -129,10 +129,7 @@ class ChessNNUE(nn.Module):
         self.l3 = nn.Linear(32, 1)
 
         # activation range scaling factor (yoinked from stockfish quantization schema)
-        self.s_A = 127
-
-        # scaling factors for quantization and activation
-        self.QA = 255 
+        self.QA = 127
         self.QB = 64
         self.QO = 400 
 
@@ -159,10 +156,10 @@ class ChessNNUE(nn.Module):
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
         # runs the linear layers and use clamp as ClippedReLU
-        # clip to 127.0 following stockfish schema
-        l1_x = torch.clamp(accumulator, 0.0, self.s_A)
-        l2_x = torch.clamp(self.l1(l1_x), 0.0, self.s_A)
-        l3_x = torch.clamp(self.l2(l2_x), 0.0, self.s_A)
+        l1_x = torch.clamp(accumulator, 0.0, 1.0)
+        l2_x = torch.clamp(self.l1(l1_x), 0.0, 1.0)
+        l3_x = torch.clamp(self.l2(l2_x), 0.0, 1.0)
+
 
         raw_output = self.l3(l3_x)
 
@@ -179,17 +176,22 @@ class ChessNNUE(nn.Module):
     # I think this is fixed, now the weights and biases can be stored as shorts during inference in my chess engine
     # rounding causes some precision loss on the forward pass, but the gains in performance using FP8 and FP16 compute makes up for the loss
     def quantize_weights_and_biases(self):
-        self.ft_weight_quantized = (self.ft.weight.data * QA).round().to(torch.int16)
-        self.ft_bias_quantized = (self.ft.bias.data * QA).round().to(torch.int16)
+        # Feature Transformer (ft)
+        self.ft_weight_quantized = (self.ft.weight.data * 127).round().to(torch.int16)
+        self.ft_bias_quantized = (self.ft.bias.data * 127).round().to(torch.int16)
         
-        self.l1_weight_quantized = (self.l1.weight.data * QB).round().to(torch.int8)
-        self.l1_bias_quantized = (self.l1.bias.data * QB).round().to(torch.int16)
+        # Hidden Layer 1 (l1)
+        self.l1_weight_quantized = (self.l1.weight.data * 64).round().to(torch.int8)
+        self.l1_bias_quantized = (self.l1.bias.data * 127 * 64).round().to(torch.int32)
         
-        self.l2_weight_quantized = (self.l2.weight.data * QB).round().to(torch.int8)
-        self.l2_bias_quantized = (self.l2.bias.data * QB).round().to(torch.int16)
+        # Hidden Layer 2 (l2)
+        self.l2_weight_quantized = (self.l2.weight.data * 64).round().to(torch.int8)
+        self.l2_bias_quantized = (self.l2.bias.data * 127 * 64).round().to(torch.int32)
         
-        self.l3_weight_quantized = (self.l3.weight.data * QB).round().to(torch.int16)
-        self.l3_bias_quantized = (self.l3.bias.data * QO).round().to(torch.int16)
+        # Output Layer (l3)
+        self.l3_weight_quantized = (self.l3.weight.data * (64 * 400 / 127)).round().to(torch.int8) 
+        self.l3_bias_quantized = (self.l3.bias.data * 64 * 400).round().to(torch.int32) 
+
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
     size = len(dataloader.dataset)
