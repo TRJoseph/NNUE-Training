@@ -8,19 +8,17 @@ import matplotlib.pyplot as plt
 import os
 
 # default model configuration
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 LEARNING_RATE = 0.0003
 NUM_EPOCHS = 10
 DATASET_SAMPLE_SIZE = None
 
 # mate score in centipawns, this may be worth looking at for increasing model performance
-DEFAULT_MATE_SCORE = 5000
+DEFAULT_MATE_SCORE = 3000
 
-HIDDEN_LAYER_SIZE = 1024
-QA = 127
-QB = 64
+HIDDEN_LAYER_SIZE = 2048
 # output scaling factor
-QO = 400  
+QO = 410
 
 
 class ChessDataset(Dataset):
@@ -42,7 +40,7 @@ class ChessDataset(Dataset):
         def process_eval(evaluation):
             if "#" in evaluation:
                 evaluation = -DEFAULT_MATE_SCORE if "-" in evaluation else DEFAULT_MATE_SCORE
-            return float(evaluation)
+            return np.clip(float(evaluation), -DEFAULT_MATE_SCORE, DEFAULT_MATE_SCORE)
             #return torch.sigmoid(torch.tensor(float(evaluation) / SCALE))
 
         self.chess_labels["eval"] = self.chess_labels["eval"].apply(process_eval)
@@ -94,6 +92,10 @@ class ChessDataset(Dataset):
         self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
         self.feature_length = len(self.white_features)
 
+        print(f"Dataset size: {len(self.chess_labels)}")
+        print(f"Mean eval: {self.chess_labels['eval'].mean()}")
+        print(f"Std eval: {self.chess_labels['eval'].std()}")
+
     def __len__(self):
         return self.feature_length
     
@@ -114,83 +116,59 @@ class ChessDataset(Dataset):
 def cp_to_wdl(cp):
     return torch.sigmoid(cp / QO)
 
-def wdl_to_cp(wdl):
-    # Avoid extreme values by clamping
-    wdl_clamped = torch.clamp(wdl, 0.001, 0.999)
-    return -QO * torch.log((1 / wdl_clamped) - 1)
+# def wdl_to_cp(wdl):
+#     # Avoid extreme values by clamping
+#     wdl_clamped = torch.clamp(wdl, 0.001, 0.999)
+#     return -QO * torch.log((1 / wdl_clamped) - 1)
 
 class ChessNNUE(nn.Module):
     def __init__(self):
         super(ChessNNUE, self).__init__()
-
         self.ft = nn.Linear(768, HIDDEN_LAYER_SIZE)
-        self.l1 = nn.Linear(2 * HIDDEN_LAYER_SIZE, 8)
-        self.l2 = nn.Linear(8, 32)
-        self.l3 = nn.Linear(32, 1)
-
-        # activation range scaling factor (yoinked from stockfish quantization schema)
-        self.QA = 127
+        self.l1 = nn.Linear(2 * HIDDEN_LAYER_SIZE, 128)
+        self.l2 = nn.Linear(128, 1)
+        self.QA = 255
         self.QB = 64
-        self.QO = 400 
 
-        nn.init.xavier_uniform_(self.ft.weight, gain=0.01)
-        nn.init.xavier_uniform_(self.l1.weight, gain=0.01)
-        nn.init.xavier_uniform_(self.l2.weight, gain=0.01)
-        nn.init.xavier_uniform_(self.l3.weight, gain=0.01)
-        
-        # Initialize biases to small values
-        nn.init.zeros_(self.ft.bias)
-        nn.init.zeros_(self.l1.bias)
-        nn.init.zeros_(self.l2.bias)
-        nn.init.zeros_(self.l3.bias)
-
-
-    # The inputs are a whole batch!
     # `stm` indicates whether white is the side to move. 1 = true, 0 = false.
     def forward(self, white_features, black_features, stm, inference=False):
-        w = self.ft(white_features)  # white's perspective
-        b = self.ft(black_features)  # black's perspective
+        w = self.ft(white_features)
+        b = self.ft(black_features)
 
         # we order the accumulators for 2 perspectives based on who is to move.
         # So we blend two possible orderings by interpolating between `stm` and `1-stm` tensors.
         accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
 
-        # runs the linear layers and use clamp as ClippedReLU
-        l1_x = torch.clamp(accumulator, 0.0, 1.0)
-        l2_x = torch.clamp(self.l1(l1_x), 0.0, 1.0)
-        l3_x = torch.clamp(self.l2(l2_x), 0.0, 1.0)
-
-
-        raw_output = self.l3(l3_x)
+        # runs the linear layers and use clamp as ClippedReLU, uses 255 as clamp range to keep values in int8 range
+        l1_x = torch.clamp(accumulator, 0.0, self.QA)
+        l2_x = torch.clamp(self.l1(l1_x), 0.0, self.QA)
+        raw_output = self.l2(l2_x)
 
         # during inference, scale output instead of passing evaluation through sigmoid
         if inference:
-            # this output is with the scaling factor applied, in TigerEngine, the only code in the forward pass will be inference (obviously)
-            output = raw_output * self.QO
-            return output, raw_output
-            
-        output = torch.sigmoid(raw_output)
-
-        return output, raw_output
+            return raw_output * QO, raw_output
+        
+        norm_output = torch.sigmoid(raw_output)
+        return norm_output, raw_output
     
     # I think this is fixed, now the weights and biases can be stored as shorts during inference in my chess engine
     # rounding causes some precision loss on the forward pass, but the gains in performance using FP8 and FP16 compute makes up for the loss
     def quantize_weights_and_biases(self):
         # Feature Transformer (ft)
-        self.ft_weight_quantized = (self.ft.weight.data * 127).round().to(torch.int16)
-        self.ft_bias_quantized = (self.ft.bias.data * 127).round().to(torch.int16)
+        self.ft_weight_quantized = (self.ft.weight.data * self.QA).round().to(torch.int16)
+        self.ft_bias_quantized = (self.ft.bias.data * self.QA).round().to(torch.int16)
         
         # Hidden Layer 1 (l1)
-        self.l1_weight_quantized = (self.l1.weight.data * 64).round().to(torch.int8)
-        self.l1_bias_quantized = (self.l1.bias.data * 127 * 64).round().to(torch.int32)
+        self.l1_weight_quantized = (self.l1.weight.data * self.QB).round().to(torch.int8)
+        self.l1_bias_quantized = (self.l1.bias.data * self.QA * self.QB).round().to(torch.int32)
         
         # Hidden Layer 2 (l2)
-        self.l2_weight_quantized = (self.l2.weight.data * 64).round().to(torch.int8)
-        self.l2_bias_quantized = (self.l2.bias.data * 127 * 64).round().to(torch.int32)
+        self.l2_weight_quantized = (self.l2.weight.data * (self.QB * QO) / self.QA).round().to(torch.int8)
+        self.l2_bias_quantized = (self.l2.bias.data * self.QB * QO).round().to(torch.int32)
         
-        # Output Layer (l3)
-        self.l3_weight_quantized = (self.l3.weight.data * (64 * 400 / 127)).round().to(torch.int8) 
-        self.l3_bias_quantized = (self.l3.bias.data * 64 * 400).round().to(torch.int32) 
+        # # Output Layer (l3)
+        # self.l3_weight_quantized = (self.l3.weight.data * ((self.QB * QO) / self.QA)).round().to(torch.int8) 
+        # self.l3_bias_quantized = (self.l3.bias.data * self.QB * QO).round().to(torch.int32) 
 
     
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
@@ -206,8 +184,8 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
             raw_eval.to("cuda"),
         )
 
-        pred_sigmoid, pred_raw = model(white_features, black_features, stm)
-        loss = loss_fn(pred_sigmoid, target)
+        pred_norm, pred_raw = model(white_features, black_features, stm)
+        loss = loss_fn(pred_norm, target)
         loss.backward()
 
         # Gradient clipping to prevent exploding gradients
@@ -231,9 +209,9 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
         if epoch <= 1 and batch % 500 == 0:
             with torch.no_grad():
                 # For visualization, convert sigmoid back to centipawn
-                pred_cp = wdl_to_cp(pred_sigmoid[:3])
+                pred_raw = pred_raw * QO
                 for i in range(3):
-                    print(f"  Sample {i}: Pred CP: {pred_cp[i].item():.1f}, Actual CP: {raw_eval[i].item():.1f}")
+                    print(f"  Sample {i}: Pred CP: {pred_raw[i].item():.1f}, Actual CP: {raw_eval[i].item():.1f}")
 
     return running_loss / len(dataloader)
     
@@ -254,14 +232,12 @@ def test_loop(dataloader, model, loss_fn):
                 raw_eval.to("cuda"),
             )
             
-            pred_sigmoid, pred_raw = model(white_features, black_features, stm)
-            
+            pred_norm, pred_raw = model(white_features, black_features, stm)
             # loss is on the sigmoid values 
-            loss = loss_fn(pred_sigmoid, target)
+            loss = loss_fn(pred_norm, target)
             total_loss += loss.item() * len(white_features)
-            
-            pred_cp = wdl_to_cp(pred_sigmoid)
-            mae = torch.abs(pred_cp - raw_eval).mean().item()
+
+            mae = torch.abs(pred_norm - target).mean().item() * QO
             
             total_mae += mae * len(white_features)
             num_samples += len(white_features)
@@ -270,13 +246,14 @@ def test_loop(dataloader, model, loss_fn):
     return total_loss / num_samples, total_mae / num_samples
 
     
-def run_model(dataset, loss_fn=nn.MSELoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device} device")
 
     # initialize model and optimizer
     model = ChessNNUE().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)  
 
     # splits dataset into training and test sets
     train_size = int(0.80 * len(dataset))
@@ -289,6 +266,21 @@ def run_model(dataset, loss_fn=nn.MSELoss(), lr=LEARNING_RATE, batch_size=BATCH_
     # lists to store losses for plotting
     train_losses = []
     test_losses = []
+
+    with open("AvgLossResults.txt", "a") as f:
+        f.write("\nStarting training run...\n")
+        f.write("Model Architecture for this run:\n")
+        f.write(str(model) + "\n")
+        f.write("Model Parameters:\n")
+        if(DATASET_SAMPLE_SIZE is None):
+            f.write(f"Dataset Sample Size: *ENTIRE DATASET*,\n")
+        else:
+            f.write(f"Dataset Sample Size: {DATASET_SAMPLE_SIZE},\n")
+        f.write(f"Batch Size: {BATCH_SIZE},\n")
+        f.write(f"Learning Rate: {LEARNING_RATE},\n")
+        f.write(f"Number of Epochs: {NUM_EPOCHS},\n")
+        f.write(f"Default Checkmate Score: {DEFAULT_MATE_SCORE}\n")
+        f.write(f"Output Scaling Factor (QO): {QO}\n\n")
 
     # Training loop over epochs
     for epoch in range(NUM_EPOCHS):
@@ -306,6 +298,7 @@ def run_model(dataset, loss_fn=nn.MSELoss(), lr=LEARNING_RATE, batch_size=BATCH_
 
         with open("AvgLossResults.txt", "a") as f:
             f.write(f"Epoch {epoch + 1}: Train Loss = {train_loss:.6f}, Test Loss = {test_loss:.6f}, MAE = {test_mae:.6f}\n")
+        scheduler.step()
 
     print("Training Done!")
     return model, train_losses, test_losses
@@ -381,12 +374,12 @@ def main():
             "ft.weight": model.ft.weight,  
             "l1.weight": model.l1.weight,
             "l2.weight": model.l2.weight,
-            "l3.weight": model.l3.weight,
+            # "l3.weight": model.l3.weight,
 
             "ft.bias": model.ft.bias,
             "l1.bias": model.l1.bias,
             "l2.bias": model.l2.bias,
-            "l3.bias": model.l3.bias,
+            # "l3.bias": model.l3.bias,
         }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
 
         # export quantized weights
@@ -394,12 +387,12 @@ def main():
             "ft.weight": model.ft_weight_quantized,  
             "l1.weight": model.l1_weight_quantized,
             "l2.weight": model.l2_weight_quantized,
-            "l3.weight": model.l3_weight_quantized,
+            # "l3.weight": model.l3_weight_quantized,
 
             "ft.bias": model.ft_bias_quantized,
             "l1.bias": model.l1_bias_quantized,
             "l2.bias": model.l2_bias_quantized,
-            "l3.bias": model.l3_bias_quantized,
+            # "l3.bias": model.l3_bias_quantized,
         }, os.path.join(save_dir, "nnue_weightsQuantized.pt"))
 
 if __name__ == "__main__":

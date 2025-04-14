@@ -4,7 +4,7 @@ import json
 
 ### This script is responsible for generating binary and json weight + bias files for use in my chess engine ###
 
-def save_quantized_weights(pt_file, output_file="nnue_weightsQuantized.bin"):
+def save_quantized_weights(pt_file, output_file="weights/nn_weightsQuantized.nnue"):
     # Load PyTorch checkpoint
     model_data = torch.load(pt_file, map_location="cpu")
 
@@ -13,14 +13,12 @@ def save_quantized_weights(pt_file, output_file="nnue_weightsQuantized.bin"):
         model_data["ft.weight"].detach().transpose(0,1).numpy().astype(np.int16),
         model_data["l1.weight"].detach().transpose(0,1).numpy().astype(np.int8),
         model_data["l2.weight"].detach().transpose(0,1).numpy().astype(np.int8),
-        model_data["l3.weight"].detach().transpose(0,1).numpy().astype(np.int8),
     ]
     
     biases = [
         model_data["ft.bias"].numpy().astype(np.int16),
         model_data["l1.bias"].numpy().astype(np.int32),
         model_data["l2.bias"].numpy().astype(np.int32),
-        model_data["l3.bias"].numpy().astype(np.int32),
     ]
 
     # Save all weights and biases as a binary file
@@ -30,7 +28,7 @@ def save_quantized_weights(pt_file, output_file="nnue_weightsQuantized.bin"):
         for b in biases:
             b.tofile(f)
 
-def save_quantized_weights_json(pt_file, output_file="nnue_weightsQuantized.json"):
+def save_quantized_weights_json(pt_file, output_file="weights/nnue_weightsQuantized.json"):
     # Load PyTorch checkpoint
     model_data = torch.load(pt_file, map_location="cpu")
 
@@ -39,12 +37,10 @@ def save_quantized_weights_json(pt_file, output_file="nnue_weightsQuantized.json
         "ft.weight": model_data["ft.weight"].detach().transpose(0,1).numpy().astype(np.int16).tolist(),
         "l1.weight": model_data["l1.weight"].detach().transpose(0,1).numpy().astype(np.int8).tolist(),
         "l2.weight": model_data["l2.weight"].detach().transpose(0,1).numpy().astype(np.int8).tolist(),
-        "l3.weight": model_data["l3.weight"].detach().transpose(0,1).numpy().astype(np.int8).tolist(),
 
         "ft.bias": model_data["ft.bias"].numpy().astype(np.int16).tolist(),
         "l1.bias": model_data["l1.bias"].numpy().astype(np.int32).tolist(),
-        "l2.bias": model_data["l2.bias"].numpy().astype(np.int32).tolist(),
-        "l3.bias": model_data["l3.bias"].numpy().astype(np.int32).tolist(),
+        "l2.bias": model_data["l2.bias"].numpy().astype(np.int32).tolist()
     }
 
     # Save as JSON
@@ -52,7 +48,7 @@ def save_quantized_weights_json(pt_file, output_file="nnue_weightsQuantized.json
         json.dump(weights, f)
 
 
-def save_normal_weights(pt_file, output_file="nnue_weightsNormal.bin"):
+def save_normal_weights(pt_file, output_file="weights/nn_weightsNormal.nnue"):
     # Load PyTorch checkpoint
     model_data = torch.load(pt_file, map_location="cpu")
 
@@ -60,15 +56,13 @@ def save_normal_weights(pt_file, output_file="nnue_weightsNormal.bin"):
     weights = [
         model_data["ft.weight"].detach().transpose(0, 1).numpy().astype(np.float32),
         model_data["l1.weight"].detach().transpose(0, 1).numpy().astype(np.float32),
-        model_data["l2.weight"].detach().transpose(0, 1).numpy().astype(np.float32),
-        model_data["l3.weight"].detach().transpose(0, 1).numpy().astype(np.float32),
+        model_data["l2.weight"].detach().transpose(0, 1).numpy().astype(np.float32)
     ]
     
     biases = [
         model_data["ft.bias"].detach().numpy().astype(np.float32),
         model_data["l1.bias"].detach().numpy().astype(np.float32),
-        model_data["l2.bias"].detach().numpy().astype(np.float32),
-        model_data["l3.bias"].detach().numpy().astype(np.float32),
+        model_data["l2.bias"].detach().numpy().astype(np.float32)
     ]
 
     # Save all weights and biases as a binary file
@@ -78,7 +72,7 @@ def save_normal_weights(pt_file, output_file="nnue_weightsNormal.bin"):
         for b in biases:
             b.tofile(f)
 
-def save_normal_weights_json(pt_file, output_file="nnue_weightsNormal.json"):
+def save_normal_weights_json(pt_file, output_file="weights/nn_weightsNormal.json"):
     # Load PyTorch checkpoint
     model_data = torch.load(pt_file, map_location="cpu")
     
@@ -87,12 +81,10 @@ def save_normal_weights_json(pt_file, output_file="nnue_weightsNormal.json"):
         "ft.weight": model_data["ft.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
         "l1.weight": model_data["l1.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
         "l2.weight": model_data["l2.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
-        "l3.weight": model_data["l3.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
 
         "ft.bias": model_data["ft.bias"].detach().numpy().astype(np.float32).tolist(),
         "l1.bias": model_data["l1.bias"].detach().numpy().astype(np.float32).tolist(),
         "l2.bias": model_data["l2.bias"].detach().numpy().astype(np.float32).tolist(),
-        "l3.bias": model_data["l3.bias"].detach().numpy().astype(np.float32).tolist(),
     }
 
     # Save as JSON
