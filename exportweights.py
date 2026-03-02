@@ -1,104 +1,132 @@
+"""
+exportweights.py
+────────────────
+Export trained NNUE weights to binary (.nnue) and JSON formats for use in the
+chess engine.
+
+Binary layout (weights then biases, in order ft → l1 → l2):
+    Quantized  : ft [int16], l1 [int8], l2 [int8], ft_b [int32], l1_b [int32], l2_b [int32]
+    Normal     : ft [float32], l1 [float32], l2 [float32], ft_b [float32], l1_b [float32], l2_b [float32]
+
+Weight matrices are transposed (shape [in, out]) so the engine can use
+column-major access patterns when building the accumulator.
+
+Chess engine inference note:
+    centipawns = out_q >> 12   (integer output divided by QB² = 64² = 4096)
+"""
+
 import torch
 import numpy as np
 import json
+import os
 
-### This script is responsible for generating binary and json weight + bias files for use in my chess engine ###
 
-def save_quantized_weights(pt_file, output_file="weights/nn_weightsQuantized.nnue"):
-    # Load PyTorch checkpoint
-    model_data = torch.load(pt_file, map_location="cpu")
+def _load(pt_file: str) -> dict:
+    return torch.load(pt_file, map_location="cpu")
 
-    # Extract weights and biases as numpy arrays (ensure they are in FP16 or INT8 format)
+
+# ── Quantized (integer) exports ───────────────────────────────────────────────
+
+def save_quantized_binary(pt_file: str, output_file: str = "weights/nn_weightsQuantized.nnue"):
+    """Save quantized weights as a packed binary file."""
+    d = _load(pt_file)
+
     weights = [
-        model_data["ft.weight"].detach().transpose(0,1).numpy().astype(np.int16),
-        model_data["l1.weight"].detach().transpose(0,1).numpy().astype(np.int8),
-        model_data["l2.weight"].detach().transpose(0,1).numpy().astype(np.int8),
+        d["ft.weight"].numpy().astype(np.int16).T,   # [768, HIDDEN]
+        d["l1.weight"].numpy().astype(np.int8).T,    # [2*HIDDEN, 128]
+        d["l2.weight"].numpy().astype(np.int8).T,    # [128, 1]
     ]
-    
     biases = [
-        model_data["ft.bias"].numpy().astype(np.int16),
-        model_data["l1.bias"].numpy().astype(np.int32),
-        model_data["l2.bias"].numpy().astype(np.int32),
+        d["ft.bias"].numpy().astype(np.int16),       # [HIDDEN] int16: matches accumulator dtype for SIMD
+        d["l1.bias"].numpy().astype(np.int32),       # [128]
+        d["l2.bias"].numpy().astype(np.int32),       # [1]
     ]
 
-    # Save all weights and biases as a binary file
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "wb") as f:
-        for w in weights:
-            w.tofile(f)
-        for b in biases:
-            b.tofile(f)
+        for arr in weights + biases:
+            arr.tofile(f)
 
-def save_quantized_weights_json(pt_file, output_file="weights/nnue_weightsQuantized.json"):
-    # Load PyTorch checkpoint
-    model_data = torch.load(pt_file, map_location="cpu")
+    print(f"Saved quantized binary → {output_file}")
 
-    # Convert tensors to lists of int16
-    weights = {
-        "ft.weight": model_data["ft.weight"].detach().transpose(0,1).numpy().astype(np.int16).tolist(),
-        "l1.weight": model_data["l1.weight"].detach().transpose(0,1).numpy().astype(np.int8).tolist(),
-        "l2.weight": model_data["l2.weight"].detach().transpose(0,1).numpy().astype(np.int8).tolist(),
 
-        "ft.bias": model_data["ft.bias"].numpy().astype(np.int16).tolist(),
-        "l1.bias": model_data["l1.bias"].numpy().astype(np.int32).tolist(),
-        "l2.bias": model_data["l2.bias"].numpy().astype(np.int32).tolist()
+def save_quantized_json(pt_file: str, output_file: str = "weights/nnue_weightsQuantized.json"):
+    """Save quantized weights as JSON (useful for debugging / JS engines)."""
+    d = _load(pt_file)
+
+    data = {
+        "ft.weight": d["ft.weight"].numpy().astype(np.int16).T.tolist(),
+        "l1.weight": d["l1.weight"].numpy().astype(np.int8).T.tolist(),
+        "l2.weight": d["l2.weight"].numpy().astype(np.int8).T.tolist(),
+        "ft.bias":   d["ft.bias"].numpy().astype(np.int16).tolist(),
+        "l1.bias":   d["l1.bias"].numpy().astype(np.int32).tolist(),
+        "l2.bias":   d["l2.bias"].numpy().astype(np.int32).tolist(),
     }
 
-    # Save as JSON
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w") as f:
-        json.dump(weights, f)
+        json.dump(data, f)
+
+    print(f"Saved quantized JSON → {output_file}")
 
 
-def save_normal_weights(pt_file, output_file="weights/nn_weightsNormal.nnue"):
-    # Load PyTorch checkpoint
-    model_data = torch.load(pt_file, map_location="cpu")
+# ── Float (normal) exports ────────────────────────────────────────────────────
 
-    # Extract weights and biases as numpy arrays (in float32 format for normal weights)
+def save_normal_binary(pt_file: str, output_file: str = "weights/nn_weightsNormal.nnue"):
+    """Save float32 weights as a packed binary file."""
+    d = _load(pt_file)
+
     weights = [
-        model_data["ft.weight"].detach().transpose(0, 1).numpy().astype(np.float32),
-        model_data["l1.weight"].detach().transpose(0, 1).numpy().astype(np.float32),
-        model_data["l2.weight"].detach().transpose(0, 1).numpy().astype(np.float32)
+        d["ft.weight"].numpy().astype(np.float32).T,
+        d["l1.weight"].numpy().astype(np.float32).T,
+        d["l2.weight"].numpy().astype(np.float32).T,
     ]
-    
     biases = [
-        model_data["ft.bias"].detach().numpy().astype(np.float32),
-        model_data["l1.bias"].detach().numpy().astype(np.float32),
-        model_data["l2.bias"].detach().numpy().astype(np.float32)
+        d["ft.bias"].numpy().astype(np.float32),
+        d["l1.bias"].numpy().astype(np.float32),
+        d["l2.bias"].numpy().astype(np.float32),
     ]
 
-    # Save all weights and biases as a binary file
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "wb") as f:
-        for w in weights:
-            w.tofile(f)
-        for b in biases:
-            b.tofile(f)
+        for arr in weights + biases:
+            arr.tofile(f)
 
-def save_normal_weights_json(pt_file, output_file="weights/nn_weightsNormal.json"):
-    # Load PyTorch checkpoint
-    model_data = torch.load(pt_file, map_location="cpu")
-    
-    # Convert tensors to lists of float32 (normal weights)
-    weights = {
-        "ft.weight": model_data["ft.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
-        "l1.weight": model_data["l1.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
-        "l2.weight": model_data["l2.weight"].detach().transpose(0,1).numpy().astype(np.float32).tolist(),
+    print(f"Saved normal binary → {output_file}")
 
-        "ft.bias": model_data["ft.bias"].detach().numpy().astype(np.float32).tolist(),
-        "l1.bias": model_data["l1.bias"].detach().numpy().astype(np.float32).tolist(),
-        "l2.bias": model_data["l2.bias"].detach().numpy().astype(np.float32).tolist(),
+
+def save_normal_json(pt_file: str, output_file: str = "weights/nn_weightsNormal.json"):
+    """Save float32 weights as JSON."""
+    d = _load(pt_file)
+
+    data = {
+        "ft.weight": d["ft.weight"].numpy().astype(np.float32).T.tolist(),
+        "l1.weight": d["l1.weight"].numpy().astype(np.float32).T.tolist(),
+        "l2.weight": d["l2.weight"].numpy().astype(np.float32).T.tolist(),
+        "ft.bias":   d["ft.bias"].numpy().astype(np.float32).tolist(),
+        "l1.bias":   d["l1.bias"].numpy().astype(np.float32).tolist(),
+        "l2.bias":   d["l2.bias"].numpy().astype(np.float32).tolist(),
     }
 
-    # Save as JSON
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w") as f:
-        json.dump(weights, f)
+        json.dump(data, f)
 
-def count_zeros(lst):
-    return len(lst)
-save_quantized_weights("weights/nnue_weightsQuantized.pt")
-save_quantized_weights_json("weights/nnue_weightsQuantized.pt")
+    print(f"Saved normal JSON → {output_file}")
 
 
-save_normal_weights("weights/nnue_weightsNormal.pt")
-save_normal_weights_json("weights/nnue_weightsNormal.pt")
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    quantized_pt = "weights/nnue_weightsQuantized.pt"
+    normal_pt    = "weights/nnue_weightsNormal.pt"
+
+    save_quantized_binary(quantized_pt)
+    save_quantized_json(quantized_pt)
+
+    save_normal_binary(normal_pt)
+    save_normal_json(normal_pt)
 
 
-
+if __name__ == "__main__":
+    main()

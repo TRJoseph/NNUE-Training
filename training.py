@@ -7,393 +7,404 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-# default model configuration
+# ── Hyperparameters ───────────────────────────────────────────────────────────
 BATCH_SIZE = 128
 LEARNING_RATE = 0.0003
 NUM_EPOCHS = 10
-DATASET_SAMPLE_SIZE = None
+DATASET_SAMPLE_SIZE = None  # None = entire dataset
 
-# mate score in centipawns, this may be worth looking at for increasing model performance
+# ── Quantization constants ────────────────────────────────────────────────────
+# These must be kept in sync with the chess engine.
+#
+# Quantization scheme (engine integer inference):
+#
+#   FT layer  (input x is binary {0,1}):
+#     acc_q  = ft_w_q @ x + ft_b_q   ≈  QA * acc_float      [int32]
+#     h1_q   = clamp(acc_q, 0, QA)   ≈  QA * h1_float       [int16, range 0..QA]
+#
+#   L1 layer:
+#     z1_q   = l1_w_q @ h1_q + l1_b_q  ≈  QA*QB * z1_float  [int32]
+#     h2_q   = clamp(z1_q, 0, QA*QB)   ≈  QA*QB * h2_float  [int32, range 0..QA*QB]
+#
+#   L2 layer (output):
+#     out_q  = l2_w_q @ h2_q + l2_b_q  ≈  QB²*QO * out_float [int32]
+#
+#   Chess engine final step:
+#     centipawns = out_q >> 12          (divide by QB² = 4096)
+#
+QA = 255    # feature-transformer activation scale
+QB = 64     # hidden-layer weight scale
+QO = 410    # output scale (centipawns ≈ raw_output × QO)
+
+# Clamp out-of-range mate scores to this value (centipawns)
 DEFAULT_MATE_SCORE = 3000
 
 HIDDEN_LAYER_SIZE = 2048
-# output scaling factor
-QO = 410
+
+# ── Shared utilities ──────────────────────────────────────────────────────────
+_PIECE_MAP = {
+    chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+    chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5,
+}
 
 
-class ChessDataset(Dataset):
-    def __init__(self, chess_positions_file, device="cuda", transform=None, target_transform=None, start_idx=0, end_idx=None):
-        self.device = device
-        self.transform = transform
-        self.target_transform = target_transform
-        self.feature_length = 0
-        # all pieces from white's perspective
-        self.white_features = []
-        # all pieces from black's perspective
-        self.black_features = []
-        # side to move
-        self.stm = []
+def board_to_features(board: chess.Board):
+    """
+    Convert a chess.Board to two 768-element binary feature arrays and a STM flag.
 
-        # load dataset 
-        self.chess_labels = pd.read_csv("./Data/" + chess_positions_file, names=["fen", "eval"], encoding='utf-8')
+    Feature layout: square_index * 12 + piece_type_index + (6 if opponent_piece else 0)
+      - White perspective: own pieces at type indices 0-5, opponent at 6-11 (per square)
+      - Black perspective: board is vertically mirrored so black's own pieces are at 0-5
 
-        def process_eval(evaluation):
-            if "#" in evaluation:
-                evaluation = -DEFAULT_MATE_SCORE if "-" in evaluation else DEFAULT_MATE_SCORE
-            return np.clip(float(evaluation), -DEFAULT_MATE_SCORE, DEFAULT_MATE_SCORE)
-            #return torch.sigmoid(torch.tensor(float(evaluation) / SCALE))
+    Returns:
+        white_feature  np.ndarray float32 [768]
+        black_feature  np.ndarray float32 [768]
+        stm            int  1 = white to move, 0 = black to move
+    """
+    white_feature = np.zeros(768, dtype=np.float32)
+    black_feature = np.zeros(768, dtype=np.float32)
 
-        self.chess_labels["eval"] = self.chess_labels["eval"].apply(process_eval)
+    for square, piece in board.piece_map().items():
+        piece_idx = _PIECE_MAP[piece.piece_type]
 
-        # this allows the program to grow or shrink the sample set from the dataset instead of using every single position found in the file
-        if end_idx is None:
-            end_idx = len(self.chess_labels)
+        # White perspective (normal board orientation)
+        w_idx = square * 12 + piece_idx + (6 if piece.color == chess.BLACK else 0)
+        white_feature[w_idx] = 1.0
 
-        # keeps track of labels for later use
-        labels = []
+        # Black perspective (vertically mirrored board)
+        flipped = chess.square_mirror(square)
+        b_idx = flipped * 12 + piece_idx + (6 if piece.color == chess.WHITE else 0)
+        black_feature[b_idx] = 1.0
 
-        piece_map = {
-            chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-            chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
-        }
+    stm = 1 if board.turn == chess.WHITE else 0
+    return white_feature, black_feature, stm
 
-        print(f"\nConverting {str(end_idx - start_idx)} board positions to feature arrays...\n")
-        for idx in range(start_idx, end_idx):
-            fen = self.chess_labels.iloc[idx, 0]
-            evaluation = self.chess_labels.iloc[idx, 1]
-            board = chess.Board(fen)
-            print(f"Processing position {idx + 1}...")
 
-            # initialize feature arrays for both perspectives
-            white_feature = np.zeros(768, dtype=np.float32)
-            black_feature = np.zeros(768, dtype=np.float32)
+def process_eval(evaluation) -> float:
+    """Convert a Stockfish evaluation string/value to a clipped centipawn float."""
+    s = str(evaluation).strip()
+    try:
+        # Handle mate scores: "#3", "#-5", "+M3", "-M5" etc.
+        if "#" in s or "M" in s.upper():
+            return float(-DEFAULT_MATE_SCORE if "-" in s else DEFAULT_MATE_SCORE)
+        return float(np.clip(float(s), -DEFAULT_MATE_SCORE, DEFAULT_MATE_SCORE))
+    except (ValueError, TypeError):
+        return 0.0
 
-            for square, piece in board.piece_map().items():
-                piece_idx = piece_map[piece.piece_type]
-                
-                # **WHITE PERSPECTIVE (Normal board view)**
-                index = square * 12 + piece_idx + (6 if piece.color == chess.BLACK else 0)
-                white_feature[index] = 1  # Includes both White and Black pieces
 
-                # **BLACK PERSPECTIVE (Mirrored board view)**
-                flipped_square = chess.square_mirror(square)
-                index = flipped_square * 12 + piece_idx + (6 if piece.color == chess.WHITE else 0)
-                black_feature[index] = 1  # Includes both White and Black pieces
-
-            self.white_features.append(white_feature)
-            self.black_features.append(black_feature)
-            labels.append(evaluation)
-            self.stm.append(1 if board.turn == chess.WHITE else 0)  # 1 if White to move, 0 if Black to move
-
-        print("\nConverting lists to tensors...\n")
-        self.white_features = torch.tensor(np.array(self.white_features), dtype=torch.float32, device=self.device)
-        self.black_features = torch.tensor(np.array(self.black_features), dtype=torch.float32, device=self.device)
-        self.labels = torch.tensor(np.array(labels).reshape(-1, 1), dtype=torch.float32, device=self.device)
-        self.stm = torch.tensor(np.array(self.stm), dtype=torch.float32, device=self.device)  # converts side to move into tensor
-        self.feature_length = len(self.white_features)
-
-        print(f"Dataset size: {len(self.chess_labels)}")
-        print(f"Mean eval: {self.chess_labels['eval'].mean()}")
-        print(f"Std eval: {self.chess_labels['eval'].std()}")
-
-    def __len__(self):
-        return self.feature_length
-    
-    def __getdataframe__(self):
-        return self.chess_labels
-    
-    def __getitem__(self, idx):
-        white_features = self.white_features[idx] 
-        black_features = self.black_features[idx]  
-        stm = self.stm[idx] 
-
-        raw_label = self.labels[idx]
-        sigmoid_label = cp_to_wdl(raw_label)
-        stm = stm.clone().detach().float().unsqueeze(0)
-        
-        return white_features, black_features, stm, sigmoid_label, raw_label
-    
-def cp_to_wdl(cp):
+def cp_to_wdl(cp: torch.Tensor) -> torch.Tensor:
+    """Sigmoid-normalise a centipawn evaluation into a win probability [0, 1]."""
     return torch.sigmoid(cp / QO)
 
-# def wdl_to_cp(wdl):
-#     # Avoid extreme values by clamping
-#     wdl_clamped = torch.clamp(wdl, 0.001, 0.999)
-#     return -QO * torch.log((1 / wdl_clamped) - 1)
 
+# ── Dataset ───────────────────────────────────────────────────────────────────
+class ChessDataset(Dataset):
+    """
+    Lazy-loading dataset for chess positions from a Stockfish CSV file.
+
+    Features are derived from FEN strings on-the-fly in __getitem__ so that
+    memory usage stays proportional to the raw CSV size (~strings + floats)
+    rather than pre-computing all 768-element float32 tensors upfront.
+
+    For 1 M positions this saves ~6 GB of RAM compared to eager loading.
+    The DataLoader should keep num_workers=0 on Windows to avoid spawn issues.
+    """
+
+    def __init__(self, chess_positions_file: str, start_idx: int = 0, end_idx=None):
+        filepath = os.path.join("Data", chess_positions_file)
+        df = pd.read_csv(filepath, names=["fen", "eval"], encoding="utf-8")
+
+        if end_idx is None:
+            end_idx = len(df)
+        df = df.iloc[start_idx:end_idx].reset_index(drop=True)
+
+        df["eval"] = df["eval"].apply(process_eval)
+
+        # Store only the raw strings and floats — features computed lazily.
+        self.fens  = df["fen"].to_numpy()
+        self.evals = df["eval"].to_numpy(dtype=np.float32)
+
+        print(f"Dataset loaded: {len(self.fens):,} positions")
+        print(f"  Mean eval : {self.evals.mean():+.1f} cp")
+        print(f"  Std  eval : {self.evals.std():.1f} cp")
+
+    def __len__(self):
+        return len(self.fens)
+
+    def __getitem__(self, idx):
+        board = chess.Board(self.fens[idx])
+        white_feat, black_feat, stm = board_to_features(board)
+
+        raw_eval = float(self.evals[idx])
+        wdl_label = cp_to_wdl(torch.tensor(raw_eval))
+
+        return (
+            torch.from_numpy(white_feat),                      # [768] float32
+            torch.from_numpy(black_feat),                      # [768] float32
+            torch.tensor([float(stm)]),                        # [1]   float32
+            wdl_label.reshape(1),                              # [1]   float32
+            torch.tensor([raw_eval]),                          # [1]   float32
+        )
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
 class ChessNNUE(nn.Module):
+    """
+    HalfKP-style NNUE with two symmetric accumulators (white + black perspective).
+
+    Architecture: 768 → HIDDEN_LAYER_SIZE  (×2 after perspective concat) → 128 → 1
+
+    Training:
+        Loss is computed on sigmoid(raw_output) vs cp_to_wdl(target_cp).
+        Activations are Clipped ReLU: clamp(x, 0, 1.0) in float, which maps
+        exactly to clamp(x_q, 0, QA) in integer arithmetic (x_q = QA * x_float).
+
+    Inference (chess engine):
+        See module-level comment for the full integer quantization scheme.
+        centipawns ≈ out_q >> 12   (divide by QB² = 4096)
+    """
+
     def __init__(self):
-        super(ChessNNUE, self).__init__()
+        super().__init__()
         self.ft = nn.Linear(768, HIDDEN_LAYER_SIZE)
         self.l1 = nn.Linear(2 * HIDDEN_LAYER_SIZE, 128)
         self.l2 = nn.Linear(128, 1)
-        self.QA = 255
-        self.QB = 64
 
-    # `stm` indicates whether white is the side to move. 1 = true, 0 = false.
     def forward(self, white_features, black_features, stm, inference=False):
         w = self.ft(white_features)
         b = self.ft(black_features)
 
-        # we order the accumulators for 2 perspectives based on who is to move.
-        # So we blend two possible orderings by interpolating between `stm` and `1-stm` tensors.
-        accumulator = (stm * torch.cat([w, b], dim=1)) + ((1 - stm) * torch.cat([b, w], dim=1))
+        # Concatenate accumulators so the side-to-move perspective comes first.
+        # stm shape: [batch, 1]; broadcast over [batch, 2*HIDDEN].
+        acc = stm * torch.cat([w, b], dim=1) + (1 - stm) * torch.cat([b, w], dim=1)
 
-        # runs the linear layers and use clamp as ClippedReLU, uses 255 as clamp range to keep values in int8 range
-        l1_x = torch.clamp(accumulator, 0.0, self.QA)
-        l2_x = torch.clamp(self.l1(l1_x), 0.0, self.QA)
-        raw_output = self.l2(l2_x)
+        # Clipped ReLU: [0, 1.0] in float ↔ [0, QA] in integer (x_q = QA * x_float).
+        h1 = torch.clamp(acc, 0.0, 1.0)
+        h2 = torch.clamp(self.l1(h1), 0.0, 1.0)
+        raw = self.l2(h2)
 
-        # during inference, scale output instead of passing evaluation through sigmoid
         if inference:
-            return raw_output * QO, raw_output
-        
-        norm_output = torch.sigmoid(raw_output)
-        return norm_output, raw_output
-    
-    # I think this is fixed, now the weights and biases can be stored as shorts during inference in my chess engine
-    # rounding causes some precision loss on the forward pass, but the gains in performance using FP8 and FP16 compute makes up for the loss
-    def quantize_weights_and_biases(self):
-        # Feature Transformer (ft)
-        self.ft_weight_quantized = (self.ft.weight.data * self.QA).round().to(torch.int16)
-        self.ft_bias_quantized = (self.ft.bias.data * self.QA).round().to(torch.int16)
-        
-        # Hidden Layer 1 (l1)
-        self.l1_weight_quantized = (self.l1.weight.data * self.QB).round().to(torch.int8)
-        self.l1_bias_quantized = (self.l1.bias.data * self.QA * self.QB).round().to(torch.int32)
-        
-        # Hidden Layer 2 (l2)
-        self.l2_weight_quantized = (self.l2.weight.data * (self.QB * QO) / self.QA).round().to(torch.int8)
-        self.l2_bias_quantized = (self.l2.bias.data * self.QB * QO).round().to(torch.int32)
-        
-        # # Output Layer (l3)
-        # self.l3_weight_quantized = (self.l3.weight.data * ((self.QB * QO) / self.QA)).round().to(torch.int8) 
-        # self.l3_bias_quantized = (self.l3.bias.data * self.QB * QO).round().to(torch.int32) 
+            return raw * QO, raw
 
-    
+        return torch.sigmoid(raw), raw
+
+    # ── Quantization ──────────────────────────────────────────────────────────
+    def quantize(self):
+        """
+        Compute quantized integer weights and store them as attributes.
+
+        These are used by save_weights() for export to the chess engine.
+        See the module docstring and class docstring for the full math.
+        """
+        # Feature transformer: scale by QA so binary inputs yield integer accumulators.
+        self.ft_weight_q = (self.ft.weight.data * QA).round().to(torch.int16)
+        self.ft_bias_q   = (self.ft.bias.data   * QA).round().to(torch.int16)  # int16: matches accumulator dtype for SIMD
+
+        # Hidden layer 1: scale weights by QB; bias accounts for the QA factor in h1_q.
+        self.l1_weight_q = (self.l1.weight.data * QB).round().to(torch.int8)
+        self.l1_bias_q   = (self.l1.bias.data   * QA * QB).round().to(torch.int32)
+
+        # Output layer: combined scale so the engine can recover centipawns with >> 12.
+        # l2_w_q  = l2_w * QB*QO/QA  →  out_q = QB²*QO * out_float
+        # l2_b_q  = l2_b * QB²*QO    →  centipawns = out_q / QB² = out_float * QO
+        self.l2_weight_q = (self.l2.weight.data * (QB * QO) / QA).round().to(torch.int8)
+        self.l2_bias_q   = (self.l2.bias.data   * QB * QB * QO).round().to(torch.int32)
+
+        # Quality check: warn if int8 weights are saturating.
+        for name, tensor in [("l1.weight", self.l1_weight_q), ("l2.weight", self.l2_weight_q)]:
+            sat = (tensor.abs() == 127).float().mean().item()
+            if sat > 0.01:
+                print(f"  [WARNING] {name}: {sat * 100:.1f}% of values saturated at ±127 — "
+                      "consider reducing QB or clipping weights before quantization.")
+
+    def save_weights(self, save_dir: str = "weights"):
+        """Quantize and export both float and integer weights to `save_dir`."""
+        os.makedirs(save_dir, exist_ok=True)
+        self.quantize()
+
+        # Float weights (for reloading in Python / fine-tuning)
+        torch.save({
+            "ft.weight": self.ft.weight.data,
+            "ft.bias":   self.ft.bias.data,
+            "l1.weight": self.l1.weight.data,
+            "l1.bias":   self.l1.bias.data,
+            "l2.weight": self.l2.weight.data,
+            "l2.bias":   self.l2.bias.data,
+        }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
+
+        # Quantized integer weights (for tigerengine)
+        torch.save({
+            "ft.weight": self.ft_weight_q,
+            "ft.bias":   self.ft_bias_q,
+            "l1.weight": self.l1_weight_q,
+            "l1.bias":   self.l1_bias_q,
+            "l2.weight": self.l2_weight_q,
+            "l2.bias":   self.l2_bias_q,
+        }, os.path.join(save_dir, "nnue_weightsQuantized.pt"))
+
+        print(f"Weights saved to '{save_dir}/'")
+
+
+# ── Training infrastructure ───────────────────────────────────────────────────
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
     size = len(dataloader.dataset)
     model.train()
     running_loss = 0.0
+
     for batch, (white_features, black_features, stm, target, raw_eval) in enumerate(dataloader):
-        white_features, black_features, stm, target, raw_eval = (
-            white_features.to("cuda"),
-            black_features.to("cuda"),
-            stm.to("cuda"),
-            target.to("cuda"),
-            raw_eval.to("cuda"),
-        )
+        white_features = white_features.to("cuda")
+        black_features = black_features.to("cuda")
+        stm            = stm.to("cuda")
+        target         = target.to("cuda")
+        raw_eval       = raw_eval.to("cuda")
 
         pred_norm, pred_raw = model(white_features, black_features, stm)
         loss = loss_fn(pred_norm, target)
         loss.backward()
 
-        # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        # Check for vanishing or exploding gradients
-        # for param in model.parameters():
-        #     if param.grad is not None:
-        #         grad_norm = param.grad.norm().item()
-        #         print(f"Gradient norm: {grad_norm}")
         optimizer.step()
         optimizer.zero_grad()
 
         running_loss += loss.item()
 
         if batch % 100 == 0:
-            loss, current = loss.item(), batch * batch_size + len(white_features)
-            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+            current = batch * batch_size + len(white_features)
+            print(f"loss: {loss.item():>7f}  [{current:>5d}/{size:>5d}]")
 
-         # Early in training, print some evaluations
+        # Early-epoch sample printout for a sanity check.
         if epoch <= 1 and batch % 500 == 0:
             with torch.no_grad():
-                # For visualization, convert sigmoid back to centipawn
-                pred_raw = pred_raw * QO
-                for i in range(3):
-                    print(f"  Sample {i}: Pred CP: {pred_raw[i].item():.1f}, Actual CP: {raw_eval[i].item():.1f}")
+                pred_cp = pred_raw * QO
+                for i in range(min(3, len(pred_cp))):
+                    print(f"  Sample {i}: Pred CP: {pred_cp[i].item():.1f}, "
+                          f"Actual CP: {raw_eval[i].item():.1f}")
 
     return running_loss / len(dataloader)
-    
+
 
 def test_loop(dataloader, model, loss_fn):
     model.eval()
     total_loss = 0.0
-    total_mae = 0.0
+    total_mae  = 0.0
     num_samples = 0
-    
-    with torch.no_grad():
-        for (white_features, black_features, stm, target, raw_eval) in dataloader:
-            white_features, black_features, stm, target, raw_eval = (
-                white_features.to("cuda"),
-                black_features.to("cuda"),
-                stm.to("cuda"),
-                target.to("cuda"),
-                raw_eval.to("cuda"),
-            )
-            
-            pred_norm, pred_raw = model(white_features, black_features, stm)
-            # loss is on the sigmoid values 
-            loss = loss_fn(pred_norm, target)
-            total_loss += loss.item() * len(white_features)
 
-            mae = torch.abs(pred_norm - target).mean().item() * QO
-            
-            total_mae += mae * len(white_features)
+    with torch.no_grad():
+        for white_features, black_features, stm, target, raw_eval in dataloader:
+            white_features = white_features.to("cuda")
+            black_features = black_features.to("cuda")
+            stm            = stm.to("cuda")
+            target         = target.to("cuda")
+            raw_eval       = raw_eval.to("cuda")
+
+            pred_norm, pred_raw = model(white_features, black_features, stm)
+            loss = loss_fn(pred_norm, target)
+
+            total_loss += loss.item() * len(white_features)
+            # MAE approximated in centipawn space via the sigmoid inverse scale.
+            total_mae  += torch.abs(pred_norm - target).mean().item() * QO * len(white_features)
             num_samples += len(white_features)
 
-    # return loss and MAE
     return total_loss / num_samples, total_mae / num_samples
 
-    
+
 def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device} device")
 
-    # initialize model and optimizer
-    model = ChessNNUE().to(device)
+    model     = ChessNNUE().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)  
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
-    # splits dataset into training and test sets
     train_size = int(0.80 * len(dataset))
-    test_size = len(dataset) - train_size
+    test_size  = len(dataset) - train_size
     train_data, test_data = random_split(dataset, [train_size, test_size])
 
-    train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
+    # num_workers=0: avoids Windows multiprocessing issues with chess.Board pickling.
+    train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True,  num_workers=0)
+    test_dataloader  = DataLoader(test_data,  batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # lists to store losses for plotting
     train_losses = []
-    test_losses = []
+    test_losses  = []
 
     with open("AvgLossResults.txt", "a") as f:
         f.write("\nStarting training run...\n")
-        f.write("Model Architecture for this run:\n")
-        f.write(str(model) + "\n")
-        f.write("Model Parameters:\n")
-        if(DATASET_SAMPLE_SIZE is None):
-            f.write(f"Dataset Sample Size: *ENTIRE DATASET*,\n")
-        else:
-            f.write(f"Dataset Sample Size: {DATASET_SAMPLE_SIZE},\n")
-        f.write(f"Batch Size: {BATCH_SIZE},\n")
-        f.write(f"Learning Rate: {LEARNING_RATE},\n")
-        f.write(f"Number of Epochs: {NUM_EPOCHS},\n")
-        f.write(f"Default Checkmate Score: {DEFAULT_MATE_SCORE}\n")
-        f.write(f"Output Scaling Factor (QO): {QO}\n\n")
+        f.write(f"Model Architecture:\n{model}\n")
+        f.write(f"Dataset Sample Size: {'*ENTIRE DATASET*' if DATASET_SAMPLE_SIZE is None else DATASET_SAMPLE_SIZE}\n")
+        f.write(f"Batch Size: {BATCH_SIZE}, LR: {LEARNING_RATE}, Epochs: {NUM_EPOCHS}\n")
+        f.write(f"Mate Score Cap: {DEFAULT_MATE_SCORE} cp,  QO: {QO},  QA: {QA},  QB: {QB}\n\n")
 
-    # Training loop over epochs
     for epoch in range(NUM_EPOCHS):
-        print(f"Epoch {epoch + 1}\n-------------------------------")
-        
-        # training loss
+        print(f"Epoch {epoch + 1}\n{'-' * 31}")
+
         train_loss = train_loop(train_dataloader, model, loss_fn, optimizer, batch_size, epoch)
         train_losses.append(train_loss)
-        print(f"\nTRAIN LOOP COMPLETE on Epoch {epoch + 1}\nAverage Train Loss: {train_loss:.6f}\n")
+        print(f"\nTrain loss (epoch {epoch + 1}): {train_loss:.6f}")
 
-        # test loss
         test_loss, test_mae = test_loop(test_dataloader, model, loss_fn)
         test_losses.append(test_loss)
-        print(f"Validation after Epoch {epoch + 1}\nAverage Test Loss: {test_loss:.6f}, MAE: {test_mae:.6f}\n")
+        print(f"Test  loss (epoch {epoch + 1}): {test_loss:.6f},  MAE ≈ {test_mae:.1f} cp\n")
 
         with open("AvgLossResults.txt", "a") as f:
-            f.write(f"Epoch {epoch + 1}: Train Loss = {train_loss:.6f}, Test Loss = {test_loss:.6f}, MAE = {test_mae:.6f}\n")
+            f.write(f"Epoch {epoch + 1}: Train = {train_loss:.6f}, "
+                    f"Test = {test_loss:.6f}, MAE = {test_mae:.1f} cp\n")
+
         scheduler.step()
 
-    print("Training Done!")
+    print("Training done!")
     return model, train_losses, test_losses
+
+
+# ── Plotting helpers ──────────────────────────────────────────────────────────
+def plot_normalized_test_versus_train_loss(train_losses, test_losses):
+    epoch_range = np.arange(1, NUM_EPOCHS + 1)
+    train_arr = np.array(train_losses, dtype=np.float64)
+    test_arr  = np.array(test_losses,  dtype=np.float64)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(epoch_range, train_arr / train_arr[0], marker='o', color='r', label="Training Loss")
+    plt.plot(epoch_range, test_arr  / test_arr[0],  marker='o', color='g', label="Test Loss")
+    plt.legend()
+    plt.xlabel("Epoch")
+    plt.ylabel("Normalized Loss")
+    plt.title("Normalized Loss vs. Epoch")
+    plt.grid()
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_normalized_loss_comparison(dataset):
     epoch_range = np.arange(1, NUM_EPOCHS + 1)
     plt.figure(figsize=(12, 5))
 
     for loss_fn, name, color in [
-        (nn.MSELoss(), "MSELoss", 'b'),
+        (nn.MSELoss(),    "MSELoss",    'b'),
         (nn.SmoothL1Loss(), "SmoothL1Loss", 'r'),
-        (nn.HuberLoss(), "HuberLoss", 'g')
+        (nn.HuberLoss(),  "HuberLoss",  'g'),
     ]:
-        model, train_losses, test_losses = run_model(dataset, loss_fn)
-        normalized_losses = test_losses / test_losses[0]  # Normalize to start at 1
-        plt.plot(epoch_range, normalized_losses, marker='o', linestyle='-', color=color, label=name)
+        _, _, test_losses = run_model(dataset, loss_fn)
+        arr = np.array(test_losses)
+        plt.plot(epoch_range, arr / arr[0], marker='o', color=color, label=name)
 
     plt.legend()
     plt.xlabel("Epoch")
     plt.ylabel("Normalized Loss")
-    plt.title("Normalized Loss vs. Epoch")
-    plt.grid()
-    plt.tight_layout()
-    plt.show()
-
-    return model
-
-def plot_normalized_test_versus_train_loss(train_losses, test_losses):
-    epoch_range = np.arange(1, NUM_EPOCHS + 1)
-
-    train_losses = np.array(train_losses, dtype=np.float64)
-    test_losses = np.array(test_losses, dtype=np.float64)
-
-    # normalize to start at 1 to get an idea of the relative performance
-    normalized_train_losses = train_losses / train_losses[0]
-    normalized_test_losses =  test_losses / test_losses[0]
-    plt.figure(figsize=(12, 5))
-    plt.plot(epoch_range, normalized_train_losses, marker='o', linestyle='-', color='r', label="Training Loss")
-    plt.plot(epoch_range, normalized_test_losses, marker='o', linestyle='-', color='g', label="Test Loss")
-
-    plt.legend()
-    plt.xlabel("Epoch")
-    plt.ylabel("Normalized Loss")
-    plt.title("Normalized Loss vs. Epoch")
+    plt.title("Loss Function Comparison")
     plt.grid()
     plt.tight_layout()
     plt.show()
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    print("Loading Dataset...\n")
-    # torch.device("cuda" if torch.cuda.is_available() else "cpu"
-    dataset = ChessDataset("chessData.csv", device="cpu", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
-    print("Dataset Initialized!\n")   
-    model = None
+    print("Loading dataset...\n")
+    dataset = ChessDataset("chessData.csv", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
+    print("Dataset ready.\n")
 
     model, train_losses, test_losses = run_model(dataset)
 
-    # plots test and training loss to give an idea of model performance with the default global configuration (found at the top)
-    #plot_normalized_test_versus_train_loss(train_losses, test_losses)
+    model.save_weights("weights")
 
-    # plots relative normalized losses with different loss functions, learning rates, and batch sizes
-    #model = plot_normalized_loss_comparison(dataset)
-
-    save_dir = "weights"
-
-    if model is not None:
-        ## quantizes weights and biases for use as NNUE
-        model.quantize_weights_and_biases()
-
-        # export normal weights
-        torch.save({
-            "ft.weight": model.ft.weight,  
-            "l1.weight": model.l1.weight,
-            "l2.weight": model.l2.weight,
-            # "l3.weight": model.l3.weight,
-
-            "ft.bias": model.ft.bias,
-            "l1.bias": model.l1.bias,
-            "l2.bias": model.l2.bias,
-            # "l3.bias": model.l3.bias,
-        }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
-
-        # export quantized weights
-        torch.save({
-            "ft.weight": model.ft_weight_quantized,  
-            "l1.weight": model.l1_weight_quantized,
-            "l2.weight": model.l2_weight_quantized,
-            # "l3.weight": model.l3_weight_quantized,
-
-            "ft.bias": model.ft_bias_quantized,
-            "l1.bias": model.l1_bias_quantized,
-            "l2.bias": model.l2_bias_quantized,
-            # "l3.bias": model.l3_bias_quantized,
-        }, os.path.join(save_dir, "nnue_weightsQuantized.pt"))
 
 if __name__ == "__main__":
     main()

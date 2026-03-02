@@ -1,99 +1,171 @@
+"""
+ParsePGNs.py
+────────────
+Generates a training data CSV from PGN files by sampling positions and
+evaluating them with Stockfish.
+
+Output format: one line per position: "fen,eval_centipawns"
+
+Configuration:
+  - Set STOCKFISH_PATH to your local Stockfish binary.
+  - Put .pgn or .pgn.zst files into the PGNs/ directory.
+  - Adjust MAX_POSITIONS, POSITIONS_PER_GAME, and EVAL_TIME as needed.
+"""
+
 import chess
 import chess.engine
 import chess.pgn
-import torch
-import numpy
 import os
 import random
 import zstandard as zstd
 from io import StringIO
 
-STOCKFISH_PATH = "C:/Users/trjos/Downloads/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
-PGN_DIR = "./PGNs"
-PGN_FILES = []
+# ── Configuration ─────────────────────────────────────────────────────────────
+STOCKFISH_PATH   = "C:/path/to/stockfish.exe"   # <-- update this
+PGN_DIR          = "./PGNs"
+OUTPUT_FILE      = "./Data/training_data.csv"
+MAX_POSITIONS    = 2_000_000   # stop after this many positions total
+POSITIONS_PER_GAME = 5         # positions sampled per game
+EVAL_TIME        = 0.1         # Stockfish analysis time per position (seconds)
 
-def count_games_in_pgns():
-    total_games = 0
-    for pgn_file_name in PGN_FILES:
-        full_path = os.path.join(PGN_DIR, pgn_file_name)
-        with open(full_path) as pgn_file:
-            while chess.pgn.read_game(pgn_file) is not None:
-                print(total_games)
-                total_games += 1
-        print(f"Games in {pgn_file_name}: {total_games - (total_games - total_games)}")
-    print(f"Total games across all files: {total_games}")
-    return total_games
+# Only sample moves in this ply range (avoid openings and pure endgames)
+SAMPLE_PLY_MIN = 10
+SAMPLE_PLY_MAX = 40
 
-def start_stockfish_engine(stockfish_path: str) -> chess.engine.SimpleEngine:
-    engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-    return engine
 
-def get_evaluation(engine: chess.engine.SimpleEngine, fen: str, time: float = 1.0) -> float:
-    """Get Stockfish evaluation in pawns for a FEN position."""
+# ── Stockfish helpers ─────────────────────────────────────────────────────────
+def start_engine(path: str) -> chess.engine.SimpleEngine:
+    return chess.engine.SimpleEngine.popen_uci(path)
+
+
+def get_evaluation_cp(engine: chess.engine.SimpleEngine, fen: str) -> float:
+    """
+    Return Stockfish's evaluation of `fen` in centipawns (from the side to move).
+    Mate scores are capped at ±10,000 cp.
+    Returns 0.0 on any error.
+    """
     board = chess.Board(fen)
-    info = engine.analyse(board, chess.engine.Limit(time=time))  # search for 'time' seconds
-    score = info["score"].relative.score(mate_score=10000)  # centipawns or mate
-    if score is None:
-        return 0.0
-    return score / 100.0
-    
-def get_pgns(path="."):
-    for entry in os.listdir(path):
-        PGN_FILES.append(entry)
+    info  = engine.analyse(board, chess.engine.Limit(time=EVAL_TIME))
+    score = info["score"].relative.score(mate_score=10_000)
+    return float(score) if score is not None else 0.0
 
-def parse_pgn(engine: chess.engine.SimpleEngine):
-    total_games_analyzed = 0
-    total_positions_analyzed = 0
-    for pgn_file_name in PGN_FILES:
-        full_path = os.path.join(PGN_DIR, pgn_file_name)
-        with open(full_path, "rb") as compressed_file:
-            dctx = zstd.ZstdDecompressor()
-            with dctx.stream_reader(compressed_file) as reader:
-                # Wrap the reader in a text stream for chess.pgn
+
+# ── PGN parsing ───────────────────────────────────────────────────────────────
+def get_pgn_files(directory: str) -> list[str]:
+    return [f for f in os.listdir(directory) if f.endswith((".pgn", ".pgn.zst", ".zst"))]
+
+
+def _open_pgn_stream(full_path: str):
+    """Return a text stream for a plain or zstd-compressed PGN file."""
+    if full_path.endswith(".zst"):
+        f = open(full_path, "rb")
+        dctx = zstd.ZstdDecompressor()
+        raw = dctx.stream_reader(f)
+        return raw, f  # caller must close both
+    else:
+        f = open(full_path, encoding="utf-8", errors="ignore")
+        return f, None
+
+
+def parse_pgns(engine: chess.engine.SimpleEngine) -> int:
+    """
+    Walk every PGN file in PGN_DIR, sample positions, evaluate them with
+    Stockfish, and append results to OUTPUT_FILE.
+
+    Returns the number of positions written.
+    """
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    pgn_files = get_pgn_files(PGN_DIR)
+    if not pgn_files:
+        print(f"No PGN files found in {PGN_DIR}")
+        return 0
+
+    total_positions = 0
+    total_games     = 0
+
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as out:
+        for pgn_filename in pgn_files:
+            full_path = os.path.join(PGN_DIR, pgn_filename)
+            print(f"\nProcessing: {pgn_filename}")
+
+            stream, extra = _open_pgn_stream(full_path)
+            try:
                 text_stream = StringIO()
-                buffer = ""
-                while total_positions_analyzed < 2000000:
-                    chunk = reader.read(8192).decode("utf-8", errors="ignore")  # Read 8KB at a time
-                    if not chunk:  # End of file
+                buffer      = ""
+
+                while total_positions < MAX_POSITIONS:
+                    chunk = stream.read(8192)
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode("utf-8", errors="ignore")
+                    if not chunk:
                         break
+
                     buffer += chunk
                     text_stream.seek(0)
                     text_stream.write(buffer)
                     text_stream.seek(0)
-                    pgn = chess.pgn.read_game(text_stream)
-                    if pgn is None:  # Incomplete game at buffer end
-                        buffer = buffer[text_stream.tell():]  # Keep remainder
+
+                    game = chess.pgn.read_game(text_stream)
+                    if game is None:
+                        buffer = buffer[text_stream.tell():]
                         continue
-                    buffer = buffer[text_stream.tell():]  # Clear processed part
-                    # Process the game
-                    board = pgn.board()
-                    moves = list(pgn.mainline_moves())
+                    buffer = buffer[text_stream.tell():]
+
+                    moves    = list(game.mainline_moves())
                     num_moves = len(moves)
-                    sample_indices = random.sample(range(10, min(40, num_moves)), min(5, max(0, num_moves - 10)))
+                    hi        = min(SAMPLE_PLY_MAX, num_moves)
+                    if hi <= SAMPLE_PLY_MIN:
+                        continue
+                    sample_indices = set(random.sample(
+                        range(SAMPLE_PLY_MIN, hi),
+                        min(POSITIONS_PER_GAME, hi - SAMPLE_PLY_MIN),
+                    ))
+
+                    board = game.board()
                     for i, move in enumerate(moves):
-                        if total_positions_analyzed >= 2000000:
+                        if total_positions >= MAX_POSITIONS:
                             break
                         board.push(move)
                         if i in sample_indices:
-                            fen = board.fen()
-                            eval = get_evaluation(engine, fen, 0.1)
-                            with open("training_data.txt", "a") as data_file:
-                                data_file.write(f"{fen},{eval}\n")
-                            total_positions_analyzed += 1
-                    total_games_analyzed += 1
-                    print(f"Total Games Analyzed: {total_games_analyzed}")
-                    print(f"Total Positions Analyzed: {total_positions_analyzed}")
-                    if total_positions_analyzed >= 2000000:
-                        break
-    return total_games_analyzed
+                            fen    = board.fen()
+                            cp_val = get_evaluation_cp(engine, fen)
+                            out.write(f"{fen},{cp_val:.0f}\n")
+                            total_positions += 1
 
+                    total_games += 1
+                    if total_games % 100 == 0:
+                        print(f"  Games: {total_games:,}  |  Positions: {total_positions:,}")
+
+            finally:
+                stream.close()
+                if extra:
+                    extra.close()
+
+    print(f"\nDone. {total_positions:,} positions from {total_games:,} games → {OUTPUT_FILE}")
+    return total_positions
+
+
+def count_games(directory: str) -> int:
+    """Quick count of games across all PGN files (for planning)."""
+    pgn_files = get_pgn_files(directory)
+    total = 0
+    for fname in pgn_files:
+        full_path = os.path.join(directory, fname)
+        with open(full_path, encoding="utf-8", errors="ignore") as f:
+            while chess.pgn.read_game(f) is not None:
+                total += 1
+    print(f"Total games: {total:,}  |  Est. positions at {POSITIONS_PER_GAME}/game: {total * POSITIONS_PER_GAME:,}")
+    return total
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    get_pgns(PGN_DIR)
-    #total_games = count_games_in_pgns()
-    #print(f"Estimated positions with 5 samples/game: {total_games * 5}")
-    engine = start_stockfish_engine(STOCKFISH_PATH)
-    parse_pgn(engine)
-    engine.quit()
+    engine = start_engine(STOCKFISH_PATH)
+    try:
+        parse_pgns(engine)
+    finally:
+        engine.quit()
+
 
 if __name__ == "__main__":
     main()
