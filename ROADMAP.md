@@ -1,4 +1,4 @@
-# TigerEngine NNUE — Training Roadmap
+# TigerEngine NNUE — Training Roadmap for future changes
 
 ## Current State
 
