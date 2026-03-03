@@ -39,41 +39,50 @@ QO = 410    # output scale (centipawns ≈ raw_output × QO)
 # Clamp out-of-range mate scores to this value (centipawns)
 DEFAULT_MATE_SCORE = 3000
 
-HIDDEN_LAYER_SIZE = 2048
+INPUT_FEATURE_SIZE = 40960
+HIDDEN_LAYER_SIZE = 4
+L1_SIZE = 8
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
 _PIECE_MAP = {
     chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-    chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5,
+    chess.ROOK: 3, chess.QUEEN: 4,
 }
 
 
 def board_to_features(board: chess.Board):
     """
-    Convert a chess.Board to two 768-element binary feature arrays and a STM flag.
+    Convert a chess.Board to two INPUT_FEATURE_SIZE-element binary feature arrays and a STM flag.
 
-    Feature layout: square_index * 12 + piece_type_index + (6 if opponent_piece else 0)
-      - White perspective: own pieces at type indices 0-5, opponent at 6-11 (per square)
-      - Black perspective: board is vertically mirrored so black's own pieces are at 0-5
+    HalfKP layout: king_sq * 640 + piece_sq * 10 + piece_type_index
+      - piece_type_index 0-4: own piece (P/N/B/R/Q)
+      - piece_type_index 5-9: opponent piece (P/N/B/R/Q)
+      - Kings are excluded as pieces; they are only used as the anchor square.
+      - Black perspective mirrors both king and piece squares vertically.
 
     Returns:
-        white_feature  np.ndarray float32 [768]
-        black_feature  np.ndarray float32 [768]
+        white_feature  np.ndarray float32 [INPUT_FEATURE_SIZE]
+        black_feature  np.ndarray float32 [INPUT_FEATURE_SIZE]
         stm            int  1 = white to move, 0 = black to move
     """
-    white_feature = np.zeros(768, dtype=np.float32)
-    black_feature = np.zeros(768, dtype=np.float32)
+    white_feature = np.zeros(INPUT_FEATURE_SIZE, dtype=np.float32)
+    black_feature = np.zeros(INPUT_FEATURE_SIZE, dtype=np.float32)
+
+    white_king_square_index = board.king(chess.WHITE)
+    black_king_square_index = chess.square_mirror(board.king(chess.BLACK))
 
     for square, piece in board.piece_map().items():
+        if piece.piece_type not in _PIECE_MAP:
+            continue
         piece_idx = _PIECE_MAP[piece.piece_type]
 
-        # White perspective (normal board orientation)
-        w_idx = square * 12 + piece_idx + (6 if piece.color == chess.BLACK else 0)
+        # "us"
+        w_idx = white_king_square_index * 640 + square * 10 + piece_idx + (6 if piece.color == chess.BLACK else 0)
         white_feature[w_idx] = 1.0
 
-        # Black perspective (vertically mirrored board)
+        # "them"
         flipped = chess.square_mirror(square)
-        b_idx = flipped * 12 + piece_idx + (6 if piece.color == chess.WHITE else 0)
+        b_idx = black_king_square_index * 640 + flipped * 10 + piece_idx + (6 if piece.color == chess.WHITE else 0)
         black_feature[b_idx] = 1.0
 
     stm = 1 if board.turn == chess.WHITE else 0
@@ -99,16 +108,8 @@ def cp_to_wdl(cp: torch.Tensor) -> torch.Tensor:
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class ChessDataset(Dataset):
-    """
-    Lazy-loading dataset for chess positions from a Stockfish CSV file.
-
-    Features are derived from FEN strings on-the-fly in __getitem__ so that
-    memory usage stays proportional to the raw CSV size (~strings + floats)
-    rather than pre-computing all 768-element float32 tensors upfront.
-
-    For 1 M positions this saves ~6 GB of RAM compared to eager loading.
-    The DataLoader should keep num_workers=0 on Windows to avoid spawn issues.
-    """
+    """Lazy-loading dataset. FEN features are computed on-the-fly in __getitem__.
+    Use num_workers=0 on Windows to avoid spawn issues."""
 
     def __init__(self, chess_positions_file: str, start_idx: int = 0, end_idx=None):
         filepath = os.path.join("Data", chess_positions_file)
@@ -139,11 +140,11 @@ class ChessDataset(Dataset):
         wdl_label = cp_to_wdl(torch.tensor(raw_eval))
 
         return (
-            torch.from_numpy(white_feat),                      # [768] float32
-            torch.from_numpy(black_feat),                      # [768] float32
-            torch.tensor([float(stm)]),                        # [1]   float32
-            wdl_label.reshape(1),                              # [1]   float32
-            torch.tensor([raw_eval]),                          # [1]   float32
+            torch.from_numpy(white_feat),
+            torch.from_numpy(black_feat),
+            torch.tensor([float(stm)]),
+            wdl_label.reshape(1),
+            torch.tensor([raw_eval]),
         )
 
 
@@ -152,7 +153,7 @@ class ChessNNUE(nn.Module):
     """
     HalfKP-style NNUE with two symmetric accumulators (white + black perspective).
 
-    Architecture: 768 → HIDDEN_LAYER_SIZE  (×2 after perspective concat) → 128 → 1
+    Architecture: INPUT_FEATURE_SIZE → HIDDEN_LAYER_SIZE (×2 after perspective concat) → L1_SIZE → 1
 
     Training:
         Loss is computed on sigmoid(raw_output) vs cp_to_wdl(target_cp).
@@ -166,20 +167,18 @@ class ChessNNUE(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.ft = nn.Linear(768, HIDDEN_LAYER_SIZE)
-        self.l1 = nn.Linear(2 * HIDDEN_LAYER_SIZE, 128)
-        self.l2 = nn.Linear(128, 1)
+        self.ft = nn.Linear(INPUT_FEATURE_SIZE, HIDDEN_LAYER_SIZE)
+        self.l1 = nn.Linear(2 * HIDDEN_LAYER_SIZE, L1_SIZE)
+        self.l2 = nn.Linear(L1_SIZE, 1)
 
     def forward(self, white_features, black_features, stm, inference=False):
         w = self.ft(white_features)
         b = self.ft(black_features)
 
-        # Concatenate accumulators so the side-to-move perspective comes first.
-        # stm shape: [batch, 1]; broadcast over [batch, 2*HIDDEN].
+        # STM perspective comes first in the concatenated accumulator.
         acc = stm * torch.cat([w, b], dim=1) + (1 - stm) * torch.cat([b, w], dim=1)
 
-        # Clipped ReLU: [0, 1.0] in float ↔ [0, QA] in integer (x_q = QA * x_float).
-        h1 = torch.clamp(acc, 0.0, 1.0)
+        h1 = torch.clamp(acc, 0.0, 1.0)  # Clipped ReLU
         h2 = torch.clamp(self.l1(h1), 0.0, 1.0)
         raw = self.l2(h2)
 
@@ -190,27 +189,17 @@ class ChessNNUE(nn.Module):
 
     # ── Quantization ──────────────────────────────────────────────────────────
     def quantize(self):
-        """
-        Compute quantized integer weights and store them as attributes.
-
-        These are used by save_weights() for export to the chess engine.
-        See the module docstring and class docstring for the full math.
-        """
-        # Feature transformer: scale by QA so binary inputs yield integer accumulators.
+        """Compute quantized weights for chess engine integer inference."""
         self.ft_weight_q = (self.ft.weight.data * QA).round().to(torch.int16)
         self.ft_bias_q   = (self.ft.bias.data   * QA).round().to(torch.int16)  # int16: matches accumulator dtype for SIMD
 
-        # Hidden layer 1: scale weights by QB; bias accounts for the QA factor in h1_q.
         self.l1_weight_q = (self.l1.weight.data * QB).round().to(torch.int8)
         self.l1_bias_q   = (self.l1.bias.data   * QA * QB).round().to(torch.int32)
 
-        # Output layer: combined scale so the engine can recover centipawns with >> 12.
-        # l2_w_q  = l2_w * QB*QO/QA  →  out_q = QB²*QO * out_float
-        # l2_b_q  = l2_b * QB²*QO    →  centipawns = out_q / QB² = out_float * QO
+        # l2_b_q uses QB²*QO so engine recovers centipawns with out_q >> 12
         self.l2_weight_q = (self.l2.weight.data * (QB * QO) / QA).round().to(torch.int8)
         self.l2_bias_q   = (self.l2.bias.data   * QB * QB * QO).round().to(torch.int32)
 
-        # Quality check: warn if int8 weights are saturating.
         for name, tensor in [("l1.weight", self.l1_weight_q), ("l2.weight", self.l2_weight_q)]:
             sat = (tensor.abs() == 127).float().mean().item()
             if sat > 0.01:
@@ -222,7 +211,6 @@ class ChessNNUE(nn.Module):
         os.makedirs(save_dir, exist_ok=True)
         self.quantize()
 
-        # Float weights (for reloading in Python / fine-tuning)
         torch.save({
             "ft.weight": self.ft.weight.data,
             "ft.bias":   self.ft.bias.data,
@@ -232,7 +220,6 @@ class ChessNNUE(nn.Module):
             "l2.bias":   self.l2.bias.data,
         }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
 
-        # Quantized integer weights (for tigerengine)
         torch.save({
             "ft.weight": self.ft_weight_q,
             "ft.bias":   self.ft_bias_q,
@@ -301,7 +288,6 @@ def test_loop(dataloader, model, loss_fn):
             loss = loss_fn(pred_norm, target)
 
             total_loss += loss.item() * len(white_features)
-            # MAE approximated in centipawn space via the sigmoid inverse scale.
             total_mae  += torch.abs(pred_norm - target).mean().item() * QO * len(white_features)
             num_samples += len(white_features)
 
@@ -320,7 +306,6 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
     test_size  = len(dataset) - train_size
     train_data, test_data = random_split(dataset, [train_size, test_size])
 
-    # num_workers=0: avoids Windows multiprocessing issues with chess.Board pickling.
     train_dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True,  num_workers=0)
     test_dataloader  = DataLoader(test_data,  batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -343,7 +328,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
 
         test_loss, test_mae = test_loop(test_dataloader, model, loss_fn)
         test_losses.append(test_loss)
-        print(f"Test  loss (epoch {epoch + 1}): {test_loss:.6f},  MAE ≈ {test_mae:.1f} cp\n")
+        print(f"Test loss (epoch {epoch + 1}): {test_loss:.6f},  MAE ≈ {test_mae:.1f} cp\n")
 
         with open("AvgLossResults.txt", "a") as f:
             f.write(f"Epoch {epoch + 1}: Train = {train_loss:.6f}, "

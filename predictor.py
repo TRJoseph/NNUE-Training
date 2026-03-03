@@ -30,17 +30,7 @@ def fen_to_tensors(fen: str):
 
 
 def _dequantize(weights: dict) -> dict:
-    """
-    Reconstruct float weights from the quantized integer weight dict.
-
-    Inverses of the quantization applied by ChessNNUE.quantize():
-        ft.weight_q  = round(ft.weight  * QA)           → / QA
-        ft.bias_q    = round(ft.bias    * QA)           → / QA
-        l1.weight_q  = round(l1.weight  * QB)           → / QB
-        l1.bias_q    = round(l1.bias    * QA * QB)      → / (QA * QB)
-        l2.weight_q  = round(l2.weight  * QB*QO/QA)     → * QA / (QB*QO)
-        l2.bias_q    = round(l2.bias    * QB²*QO)       → / (QB²*QO)
-    """
+    """Reconstruct float weights from the quantized integer weight dict."""
     return {
         "ft.weight": weights["ft.weight"].float() / QA,
         "ft.bias":   weights["ft.bias"].float()   / QA,
