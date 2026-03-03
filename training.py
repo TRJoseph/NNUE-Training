@@ -77,12 +77,12 @@ def board_to_features(board: chess.Board):
         piece_idx = _PIECE_MAP[piece.piece_type]
 
         # "us"
-        w_idx = white_king_square_index * 640 + square * 10 + piece_idx + (6 if piece.color == chess.BLACK else 0)
+        w_idx = white_king_square_index * 640 + square * 10 + piece_idx + (5 if piece.color == chess.BLACK else 0)
         white_feature[w_idx] = 1.0
 
         # "them"
         flipped = chess.square_mirror(square)
-        b_idx = black_king_square_index * 640 + flipped * 10 + piece_idx + (6 if piece.color == chess.WHITE else 0)
+        b_idx = black_king_square_index * 640 + flipped * 10 + piece_idx + (5 if piece.color == chess.WHITE else 0)
         black_feature[b_idx] = 1.0
 
     stm = 1 if board.turn == chess.WHITE else 0
