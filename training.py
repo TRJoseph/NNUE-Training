@@ -6,6 +6,11 @@ from torch.utils.data import DataLoader, Dataset, random_split
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import datetime
+
+# ── Configuration ───────────────────────────────────────────────────────────
+DATASET_FILE = "chessData.csv" # this needs to be in the /Data subdirectory
+LOG_FILE = "training_log.txt"
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 BATCH_SIZE = 128
@@ -246,6 +251,30 @@ class ChessNNUE(nn.Module):
         print(f"Weights saved to '{save_dir}/'")
 
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+def _run_signature(model: nn.Module, n_train: int, n_test: int) -> str:
+    total_params  = sum(p.numel() for p in model.parameters())
+    dataset_label = "entire dataset" if DATASET_SAMPLE_SIZE is None else f"{DATASET_SAMPLE_SIZE:,}"
+    ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bar = "═" * 54
+    return (
+        f"\n{bar}\n"
+        f"  NNUE Training Run — {ts}\n"
+        f"{bar}\n"
+        f"  Dataset   : {dataset_label}  (train {n_train:,}  |  test {n_test:,})\n"
+        f"  Epochs    : {NUM_EPOCHS}  |  Batch: {BATCH_SIZE}  |  LR: {LEARNING_RATE}\n"
+        f"  QA={QA}  QB={QB}  QO={QO}  MATE_CAP={DEFAULT_MATE_SCORE} cp\n"
+        f"\n"
+        f"  Architecture:\n"
+        f"    FT  : {INPUT_FEATURE_SIZE} → {HIDDEN_LAYER_SIZE}  (×2 perspectives → {2 * HIDDEN_LAYER_SIZE})\n"
+        f"    L1  : {2 * HIDDEN_LAYER_SIZE} → {L1_SIZE}\n"
+        f"    L2  : {L1_SIZE} → {L2_SIZE}\n"
+        f"    OUT : {L2_SIZE} → 1\n"
+        f"    Params: {total_params:,}\n"
+        f"{bar}\n"
+    )
+
+
 # ── Training infrastructure ───────────────────────────────────────────────────
 def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
     size = len(dataloader.dataset)
@@ -325,13 +354,12 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
 
     train_losses = []
     test_losses  = []
+    test_maes    = []
 
-    with open("AvgLossResults.txt", "a") as f:
-        f.write("\nStarting training run...\n")
-        f.write(f"Model Architecture:\n{model}\n")
-        f.write(f"Dataset Sample Size: {'*ENTIRE DATASET*' if DATASET_SAMPLE_SIZE is None else DATASET_SAMPLE_SIZE}\n")
-        f.write(f"Batch Size: {BATCH_SIZE}, LR: {LEARNING_RATE}, Epochs: {NUM_EPOCHS}\n")
-        f.write(f"Mate Score Cap: {DEFAULT_MATE_SCORE} cp,  QO: {QO},  QA: {QA},  QB: {QB}\n\n")
+    sig = _run_signature(model, train_size, test_size)
+    print(sig)
+    with open(LOG_FILE, "a") as f:
+        f.write(sig)
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch + 1}\n{'-' * 31}")
@@ -342,13 +370,25 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
 
         test_loss, test_mae = test_loop(test_dataloader, model, loss_fn)
         test_losses.append(test_loss)
+        test_maes.append(test_mae)
         print(f"Test loss (epoch {epoch + 1}): {test_loss:.6f},  MAE ≈ {test_mae:.1f} cp\n")
 
-        with open("AvgLossResults.txt", "a") as f:
-            f.write(f"Epoch {epoch + 1}: Train = {train_loss:.6f}, "
-                    f"Test = {test_loss:.6f}, MAE = {test_mae:.1f} cp\n")
+        with open(LOG_FILE, "a") as f:
+            f.write(f"Epoch {epoch + 1:>3}: Train = {train_loss:.6f}  "
+                    f"Test = {test_loss:.6f}  MAE = {test_mae:.1f} cp\n")
 
         scheduler.step()
+
+    best_epoch = int(np.argmin(test_losses)) + 1
+    summary = (
+        f"\n── Final Summary {'─' * 37}\n"
+        f"  Final   train={train_losses[-1]:.6f}  test={test_losses[-1]:.6f}  MAE={test_maes[-1]:.1f} cp\n"
+        f"  Best    test={min(test_losses):.6f}  MAE={test_maes[best_epoch-1]:.1f} cp  (epoch {best_epoch})\n"
+        f"{'─' * 54}\n"
+    )
+    print(summary)
+    with open(LOG_FILE, "a") as f:
+        f.write(summary)
 
     print("Training done!")
     return model, train_losses, test_losses
@@ -397,12 +437,12 @@ def plot_normalized_loss_comparison(dataset):
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     print("Loading dataset...\n")
-    dataset = ChessDataset("chessData.csv", start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
+    dataset = ChessDataset(DATASET_FILE, start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
     print("Dataset ready.\n")
 
     model, train_losses, test_losses = run_model(dataset)
-
     model.save_weights("weights")
+    #plot_normalized_test_versus_train_loss(train_losses, test_losses)
 
 
 if __name__ == "__main__":
