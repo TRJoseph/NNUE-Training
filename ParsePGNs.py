@@ -21,10 +21,10 @@ import zstandard as zstd
 from io import StringIO
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-STOCKFISH_PATH   = "C:/path/to/stockfish.exe"   # <-- update this
+STOCKFISH_PATH   = "C:/Users/trjos/Downloads/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 PGN_DIR          = "./PGNs"
 OUTPUT_FILE      = "./Data/training_data.csv"
-MAX_POSITIONS    = 2_000_000   # stop after this many positions total
+MAX_POSITIONS    = 20_000_000   # stop after this many positions total
 POSITIONS_PER_GAME = 5         # positions sampled per game
 EVAL_TIME        = 0.1         # Stockfish analysis time per position (seconds)
 
