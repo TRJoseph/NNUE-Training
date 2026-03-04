@@ -10,7 +10,6 @@ import datetime
 
 # ── Configuration ───────────────────────────────────────────────────────────
 DATASET_FILE = "chessData.csv" # this needs to be in the /Data subdirectory
-LOG_FILE = "training_log.txt"
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 BATCH_SIZE = 128
@@ -252,15 +251,16 @@ class ChessNNUE(nn.Module):
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-def _run_signature(model: nn.Module, n_train: int, n_test: int) -> str:
+def _run_signature(model: nn.Module, n_train: int, n_test: int, run_id: str) -> str:
     total_params  = sum(p.numel() for p in model.parameters())
     dataset_label = "entire dataset" if DATASET_SAMPLE_SIZE is None else f"{DATASET_SAMPLE_SIZE:,}"
     ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bar = "═" * 54
     return (
         f"\n{bar}\n"
-        f"  NNUE Training Run — {ts}\n"
+        f"  NNUE Training Run — {ts}  [{run_id}]\n"
         f"{bar}\n"
+        f"  Weights   : weights/{run_id}/\n"
         f"  Dataset   : {dataset_label}  (train {n_train:,}  |  test {n_test:,})\n"
         f"  Epochs    : {NUM_EPOCHS}  |  Batch: {BATCH_SIZE}  |  LR: {LEARNING_RATE}\n"
         f"  QA={QA}  QB={QB}  QO={QO}  MATE_CAP={DEFAULT_MATE_SCORE} cp\n"
@@ -338,6 +338,11 @@ def test_loop(dataloader, model, loss_fn):
 
 
 def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+    run_id   = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir  = os.path.join("weights", run_id)
+    log_path = os.path.join(run_dir, "training_log.txt")
+    os.makedirs(run_dir, exist_ok=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device} device")
 
@@ -356,9 +361,9 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
     test_losses  = []
     test_maes    = []
 
-    sig = _run_signature(model, train_size, test_size)
+    sig = _run_signature(model, train_size, test_size, run_id)
     print(sig)
-    with open(LOG_FILE, "a") as f:
+    with open(log_path, "a") as f:
         f.write(sig)
 
     for epoch in range(NUM_EPOCHS):
@@ -373,7 +378,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
         test_maes.append(test_mae)
         print(f"Test loss (epoch {epoch + 1}): {test_loss:.6f},  MAE ≈ {test_mae:.1f} cp\n")
 
-        with open(LOG_FILE, "a") as f:
+        with open(log_path, "a") as f:
             f.write(f"Epoch {epoch + 1:>3}: Train = {train_loss:.6f}  "
                     f"Test = {test_loss:.6f}  MAE = {test_mae:.1f} cp\n")
 
@@ -387,11 +392,11 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
         f"{'─' * 54}\n"
     )
     print(summary)
-    with open(LOG_FILE, "a") as f:
+    with open(log_path, "a") as f:
         f.write(summary)
 
     print("Training done!")
-    return model, train_losses, test_losses
+    return model, train_losses, test_losses, run_id
 
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
@@ -440,8 +445,8 @@ def main():
     dataset = ChessDataset(DATASET_FILE, start_idx=0, end_idx=DATASET_SAMPLE_SIZE)
     print("Dataset ready.\n")
 
-    model, train_losses, test_losses = run_model(dataset)
-    model.save_weights("weights")
+    model, train_losses, test_losses, run_id = run_model(dataset)
+    model.save_weights(f"weights/{run_id}")
     #plot_normalized_test_versus_train_loss(train_losses, test_losses)
 
 
