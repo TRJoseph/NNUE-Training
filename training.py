@@ -49,7 +49,7 @@ DEFAULT_MATE_SCORE = 3000
 
 INPUT_FEATURE_SIZE = 40960
 HIDDEN_LAYER_SIZE = 1024
-L1_SIZE = 8
+L1_SIZE = 64
 L2_SIZE = 32
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
@@ -347,7 +347,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
     print(f"Using {device} device")
 
     model     = ChessNNUE().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     train_size = int(0.80 * len(dataset))
