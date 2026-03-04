@@ -363,7 +363,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
 
     sig = _run_signature(model, train_size, test_size, run_id)
     print(sig)
-    with open(log_path, "a") as f:
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(sig)
 
     for epoch in range(NUM_EPOCHS):
@@ -378,7 +378,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
         test_maes.append(test_mae)
         print(f"Test loss (epoch {epoch + 1}): {test_loss:.6f},  MAE ≈ {test_mae:.1f} cp\n")
 
-        with open(log_path, "a") as f:
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"Epoch {epoch + 1:>3}: Train = {train_loss:.6f}  "
                     f"Test = {test_loss:.6f}  MAE = {test_mae:.1f} cp\n")
 
@@ -392,7 +392,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
         f"{'─' * 54}\n"
     )
     print(summary)
-    with open(log_path, "a") as f:
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(summary)
 
     print("Training done!")
