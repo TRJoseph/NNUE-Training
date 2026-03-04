@@ -26,8 +26,12 @@ DATASET_SAMPLE_SIZE = None  # None = entire dataset
 #     z1_q   = l1_w_q @ h1_q + l1_b_q  ≈  QA*QB * z1_float  [int32]
 #     h2_q   = clamp(z1_q, 0, QA*QB)   ≈  QA*QB * h2_float  [int32, range 0..QA*QB]
 #
-#   L2 layer (output):
-#     out_q  = l2_w_q @ h2_q + l2_b_q  ≈  QB²*QO * out_float [int32]
+#   L2 layer:
+#     z2_q   = l2_w_q @ h2_q + l2_b_q  ≈  QA*QB² * z2_float [int32]
+#     h3_q   = clamp(z2_q, 0, QA*QB²)  ≈  QA*QB² * h3_float [int32, range 0..QA*QB²]
+#
+#   L3 layer (output):
+#     out_q  = l3_w_q @ h3_q + l3_b_q  ≈  QB²*QO * out_float [int32]
 #
 #   Chess engine final step:
 #     centipawns = out_q >> 12          (divide by QB² = 4096)
@@ -40,8 +44,9 @@ QO = 410    # output scale (centipawns ≈ raw_output × QO)
 DEFAULT_MATE_SCORE = 3000
 
 INPUT_FEATURE_SIZE = 40960
-HIDDEN_LAYER_SIZE = 4
+HIDDEN_LAYER_SIZE = 1024
 L1_SIZE = 8
+L2_SIZE = 32
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
 _PIECE_MAP = {
@@ -153,7 +158,7 @@ class ChessNNUE(nn.Module):
     """
     HalfKP-style NNUE with two symmetric accumulators (white + black perspective).
 
-    Architecture: INPUT_FEATURE_SIZE → HIDDEN_LAYER_SIZE (×2 after perspective concat) → L1_SIZE → 1
+    Architecture: INPUT_FEATURE_SIZE → HIDDEN_LAYER_SIZE (×2 after perspective concat) → L1_SIZE → L2_SIZE → 1
 
     Training:
         Loss is computed on sigmoid(raw_output) vs cp_to_wdl(target_cp).
@@ -169,7 +174,8 @@ class ChessNNUE(nn.Module):
         super().__init__()
         self.ft = nn.Linear(INPUT_FEATURE_SIZE, HIDDEN_LAYER_SIZE)
         self.l1 = nn.Linear(2 * HIDDEN_LAYER_SIZE, L1_SIZE)
-        self.l2 = nn.Linear(L1_SIZE, 1)
+        self.l2 = nn.Linear(L1_SIZE, L2_SIZE)
+        self.l3 = nn.Linear(L2_SIZE, 1)
 
     def forward(self, white_features, black_features, stm, inference=False):
         w = self.ft(white_features)
@@ -180,7 +186,8 @@ class ChessNNUE(nn.Module):
 
         h1 = torch.clamp(acc, 0.0, 1.0)  # Clipped ReLU
         h2 = torch.clamp(self.l1(h1), 0.0, 1.0)
-        raw = self.l2(h2)
+        h3 = torch.clamp(self.l2(h2), 0.0, 1.0)
+        raw = self.l3(h3)
 
         if inference:
             return raw * QO, raw
@@ -196,11 +203,14 @@ class ChessNNUE(nn.Module):
         self.l1_weight_q = (self.l1.weight.data * QB).round().to(torch.int8)
         self.l1_bias_q   = (self.l1.bias.data   * QA * QB).round().to(torch.int32)
 
-        # l2_b_q uses QB²*QO so engine recovers centipawns with out_q >> 12
-        self.l2_weight_q = (self.l2.weight.data * (QB * QO) / QA).round().to(torch.int8)
-        self.l2_bias_q   = (self.l2.bias.data   * QB * QB * QO).round().to(torch.int32)
+        self.l2_weight_q = (self.l2.weight.data * QB).round().to(torch.int8)
+        self.l2_bias_q   = (self.l2.bias.data   * QA * QB * QB).round().to(torch.int32)
 
-        for name, tensor in [("l1.weight", self.l1_weight_q), ("l2.weight", self.l2_weight_q)]:
+        # l3_b_q uses QB²*QO so engine recovers centipawns with out_q >> 12
+        self.l3_weight_q = (self.l3.weight.data * QO / QA).round().to(torch.int8)
+        self.l3_bias_q   = (self.l3.bias.data   * QB * QB * QO).round().to(torch.int32)
+
+        for name, tensor in [("l1.weight", self.l1_weight_q), ("l2.weight", self.l2_weight_q), ("l3.weight", self.l3_weight_q)]:
             sat = (tensor.abs() == 127).float().mean().item()
             if sat > 0.01:
                 print(f"  [WARNING] {name}: {sat * 100:.1f}% of values saturated at ±127 — "
@@ -218,6 +228,8 @@ class ChessNNUE(nn.Module):
             "l1.bias":   self.l1.bias.data,
             "l2.weight": self.l2.weight.data,
             "l2.bias":   self.l2.bias.data,
+            "l3.weight": self.l3.weight.data,
+            "l3.bias":   self.l3.bias.data,
         }, os.path.join(save_dir, "nnue_weightsNormal.pt"))
 
         torch.save({
@@ -227,6 +239,8 @@ class ChessNNUE(nn.Module):
             "l1.bias":   self.l1_bias_q,
             "l2.weight": self.l2_weight_q,
             "l2.bias":   self.l2_bias_q,
+            "l3.weight": self.l3_weight_q,
+            "l3.bias":   self.l3_bias_q,
         }, os.path.join(save_dir, "nnue_weightsQuantized.pt"))
 
         print(f"Weights saved to '{save_dir}/'")

@@ -22,11 +22,13 @@ def save_quantized_binary(pt_file: str, output_file: str = "weights/nn_weightsQu
         d["ft.weight"].numpy().astype(np.int16).T,
         d["l1.weight"].numpy().astype(np.int8).T,
         d["l2.weight"].numpy().astype(np.int8).T,
+        d["l3.weight"].numpy().astype(np.int8).T,
     ]
     biases = [
         d["ft.bias"].numpy().astype(np.int16),   # int16: matches accumulator dtype for SIMD
         d["l1.bias"].numpy().astype(np.int32),
         d["l2.bias"].numpy().astype(np.int32),
+        d["l3.bias"].numpy().astype(np.int32),
     ]
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -45,9 +47,11 @@ def save_quantized_json(pt_file: str, output_file: str = "weights/nnue_weightsQu
         "ft.weight": d["ft.weight"].numpy().astype(np.int16).T.tolist(),
         "l1.weight": d["l1.weight"].numpy().astype(np.int8).T.tolist(),
         "l2.weight": d["l2.weight"].numpy().astype(np.int8).T.tolist(),
+        "l3.weight": d["l3.weight"].numpy().astype(np.int8).T.tolist(),
         "ft.bias":   d["ft.bias"].numpy().astype(np.int16).tolist(),
         "l1.bias":   d["l1.bias"].numpy().astype(np.int32).tolist(),
         "l2.bias":   d["l2.bias"].numpy().astype(np.int32).tolist(),
+        "l3.bias":   d["l3.bias"].numpy().astype(np.int32).tolist(),
     }
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -66,11 +70,13 @@ def save_normal_binary(pt_file: str, output_file: str = "weights/nn_weightsNorma
         d["ft.weight"].numpy().astype(np.float32).T,
         d["l1.weight"].numpy().astype(np.float32).T,
         d["l2.weight"].numpy().astype(np.float32).T,
+        d["l3.weight"].numpy().astype(np.float32).T,
     ]
     biases = [
         d["ft.bias"].numpy().astype(np.float32),
         d["l1.bias"].numpy().astype(np.float32),
         d["l2.bias"].numpy().astype(np.float32),
+        d["l3.bias"].numpy().astype(np.float32),
     ]
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -89,9 +95,11 @@ def save_normal_json(pt_file: str, output_file: str = "weights/nn_weightsNormal.
         "ft.weight": d["ft.weight"].numpy().astype(np.float32).T.tolist(),
         "l1.weight": d["l1.weight"].numpy().astype(np.float32).T.tolist(),
         "l2.weight": d["l2.weight"].numpy().astype(np.float32).T.tolist(),
+        "l3.weight": d["l3.weight"].numpy().astype(np.float32).T.tolist(),
         "ft.bias":   d["ft.bias"].numpy().astype(np.float32).tolist(),
         "l1.bias":   d["l1.bias"].numpy().astype(np.float32).tolist(),
         "l2.bias":   d["l2.bias"].numpy().astype(np.float32).tolist(),
+        "l3.bias":   d["l3.bias"].numpy().astype(np.float32).tolist(),
     }
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)

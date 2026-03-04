@@ -36,8 +36,10 @@ def _dequantize(weights: dict) -> dict:
         "ft.bias":   weights["ft.bias"].float()   / QA,
         "l1.weight": weights["l1.weight"].float() / QB,
         "l1.bias":   weights["l1.bias"].float()   / (QA * QB),
-        "l2.weight": weights["l2.weight"].float() * QA / (QB * QO),
-        "l2.bias":   weights["l2.bias"].float()   / (QB * QB * QO),
+        "l2.weight": weights["l2.weight"].float() / QB,
+        "l2.bias":   weights["l2.bias"].float()   / (QA * QB * QB),
+        "l3.weight": weights["l3.weight"].float() * QA / QO,
+        "l3.bias":   weights["l3.bias"].float()   / (QB * QB * QO),
     }
 
 
