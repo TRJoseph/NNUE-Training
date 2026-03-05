@@ -14,9 +14,10 @@ import zstandard as zstd
 # ── Configuration ──────────────────────────────────────────────────────────────
 INPUT_FILE    = "./Data/lichess_db_eval.jsonl.zst"
 OUTPUT_FILE   = "./Data/training_data.csv"
-MAX_POSITIONS = 10_000_000  # stop after writing this many positions
-MATE_SCORE_CP = 3_000       # cp to use for mate scores (matches DEFAULT_MATE_SCORE)
-MIN_DEPTH     = 20          # skip evals shallower than this (lower = noisier data)
+MAX_POSITIONS  = 10_000_000  # stop after writing this many positions
+MATE_SCORE_CP  = 3_000       # cp to use for mate scores (matches DEFAULT_MATE_SCORE)
+MIN_DEPTH      = 20          # skip evals shallower than this (lower = noisier data)
+MAX_ABS_EVAL   = 1_500       # skip positions with |eval| above this (filters decisive/noisy positions)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -46,7 +47,7 @@ def main():
     scanned = 0
 
     print(f"Reading {INPUT_FILE}")
-    print(f"Target: {MAX_POSITIONS:,} positions  |  MIN_DEPTH: {MIN_DEPTH}\n")
+    print(f"Target: {MAX_POSITIONS:,} positions  |  MIN_DEPTH: {MIN_DEPTH}  |  MAX_ABS_EVAL: {MAX_ABS_EVAL} cp\n")
 
     with (
         open(INPUT_FILE, "rb") as fh,
@@ -78,6 +79,9 @@ def main():
 
                 cp = _pv_to_cp(ev.get("pvs", []))
                 if cp is None:
+                    continue
+
+                if abs(cp) > MAX_ABS_EVAL:
                     continue
 
                 # Lichess FENs have 4 fields; append halfmove/fullmove defaults
