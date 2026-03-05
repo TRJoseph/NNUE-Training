@@ -12,10 +12,10 @@ import datetime
 DATASET_FILE = "training_data.csv" # this needs to be in the /Data subdirectory
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
-BATCH_SIZE = 128
-LEARNING_RATE = 0.001
+BATCH_SIZE = 512
+LEARNING_RATE = 0.0012
 NUM_EPOCHS = 20
-DATASET_SAMPLE_SIZE = None  # None = entire dataset
+DATASET_SAMPLE_SIZE = None
 
 # ── Quantization constants ────────────────────────────────────────────────────
 # These must be kept in sync with the chess engine.
@@ -338,6 +338,7 @@ def test_loop(dataloader, model, loss_fn):
 
 
 def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+    torch.manual_seed(42)
     run_id   = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir  = os.path.join("weights", run_id)
     log_path = os.path.join(run_dir, "training_log.txt")
@@ -447,7 +448,7 @@ def main():
 
     model, train_losses, test_losses, run_id = run_model(dataset)
     model.save_weights(f"weights/{run_id}")
-    #plot_normalized_test_versus_train_loss(train_losses, test_losses)
+    plot_normalized_test_versus_train_loss(train_losses, test_losses)
 
 
 if __name__ == "__main__":
