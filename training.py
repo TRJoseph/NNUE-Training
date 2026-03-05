@@ -9,12 +9,12 @@ import os
 import datetime
 
 # ── Configuration ───────────────────────────────────────────────────────────
-DATASET_FILE = "chessData.csv" # this needs to be in the /Data subdirectory
+DATASET_FILE = "training_data.csv" # this needs to be in the /Data subdirectory
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 BATCH_SIZE = 128
-LEARNING_RATE = 0.0003
-NUM_EPOCHS = 10
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 20
 DATASET_SAMPLE_SIZE = None  # None = entire dataset
 
 # ── Quantization constants ────────────────────────────────────────────────────
@@ -348,7 +348,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
 
     model     = ChessNNUE().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     train_size = int(0.80 * len(dataset))
     test_size  = len(dataset) - train_size
