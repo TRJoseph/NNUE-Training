@@ -280,6 +280,7 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
     size = len(dataloader.dataset)
     model.train()
     running_loss = 0.0
+    num_samples  = 0
 
     for batch, (white_features, black_features, stm, target, raw_eval) in enumerate(dataloader):
         white_features = white_features.to("cuda")
@@ -296,7 +297,8 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
         optimizer.step()
         optimizer.zero_grad()
 
-        running_loss += loss.item()
+        running_loss += loss.item() * len(white_features)
+        num_samples  += len(white_features)
 
         if batch % 100 == 0:
             current = batch * batch_size + len(white_features)
@@ -310,7 +312,7 @@ def train_loop(dataloader, model, loss_fn, optimizer, batch_size, epoch):
                     print(f"  Sample {i}: Pred CP: {pred_cp[i].item():.1f}, "
                           f"Actual CP: {raw_eval[i].item():.1f}")
 
-    return running_loss / len(dataloader)
+    return running_loss / num_samples
 
 
 def test_loop(dataloader, model, loss_fn):
@@ -331,7 +333,7 @@ def test_loop(dataloader, model, loss_fn):
             loss = loss_fn(pred_norm, target)
 
             total_loss += loss.item() * len(white_features)
-            total_mae  += torch.abs(pred_norm - target).mean().item() * QO * len(white_features)
+            total_mae  += torch.abs(pred_raw * QO - raw_eval).mean().item() * len(white_features)
             num_samples += len(white_features)
 
     return total_loss / num_samples, total_mae / num_samples
