@@ -351,7 +351,7 @@ def run_model(dataset, loss_fn=nn.HuberLoss(), lr=LEARNING_RATE, batch_size=BATC
 
     model     = ChessNNUE().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.90)
 
     train_size = int(0.80 * len(dataset))
     test_size  = len(dataset) - train_size
